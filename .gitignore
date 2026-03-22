@@ -374,4 +374,7 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
-# End of https://www.toptal.com/developers/gitignore/api/python,go,flask,windows,linux,macos,visualstudiocode
+*.db
+server/staged/
+server/loot/
+server/builds/

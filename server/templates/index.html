@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C2 — Command & Control</title>
+    <meta name="description" content="C2 Command and Control Dashboard">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+
+    <!-- ══ Sidebar Navigation ══ -->
+    <nav class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+            <span class="brand-icon">⬡</span>
+            <div class="brand-text">
+                <span class="brand-name">C2</span>
+                <span class="brand-sub">Project</span>
+            </div>
+        </div>
+
+        <div class="sidebar-nav">
+            <button class="nav-item active" data-section="control" id="nav-control" onclick="switchSection('control')">
+                <span class="nav-icon">⌘</span>
+                <span class="nav-label">Control</span>
+            </button>
+            <button class="nav-item" data-section="deploy" id="nav-deploy" onclick="switchSection('deploy')">
+                <span class="nav-icon">⚙</span>
+                <span class="nav-label">Deploy</span>
+            </button>
+        </div>
+
+        <div class="sidebar-footer">
+            <div class="server-status" id="server-status">
+                <span class="status-dot online"></span>
+                <span class="status-text">ONLINE</span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ══ Main Content Area ══ -->
+    <main class="main-content">
+
+        <!-- ════════════════════════════════════════ -->
+        <!--  SECTION: Control                       -->
+        <!-- ════════════════════════════════════════ -->
+        <section class="section active" id="section-control">
+
+            <!-- Stat Cards -->
+            <div class="stat-bar">
+                <div class="stat-card">
+                    <div class="stat-icon agents-icon">◉</div>
+                    <div class="stat-info">
+                        <span class="stat-value" id="stat-agents">0</span>
+                        <span class="stat-label">Active Agents</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon pending-icon">◷</div>
+                    <div class="stat-info">
+                        <span class="stat-value" id="stat-pending">0</span>
+                        <span class="stat-label">Pending Tasks</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon complete-icon">✓</div>
+                    <div class="stat-info">
+                        <span class="stat-value" id="stat-completed">0</span>
+                        <span class="stat-label">Completed</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon builds-icon">⚙</div>
+                    <div class="stat-info">
+                        <span class="stat-value" id="stat-builds">0</span>
+                        <span class="stat-label">Builds</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Two-Column Layout -->
+            <div class="control-layout">
+
+                <!-- Left: Agent List -->
+                <aside class="panel agent-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title">
+                            <span class="panel-icon">◉</span> Agents
+                        </h2>
+                        <button class="btn-icon" id="refresh-agents" title="Refresh">⟳</button>
+                    </div>
+                    <div class="agent-list" id="agent-list">
+                        <div class="empty-state" id="empty-agents">
+                            <span class="empty-icon">📡</span>
+                            <p>No agents connected</p>
+                            <p class="empty-sub">Waiting for check-ins…</p>
+                        </div>
+                    </div>
+                </aside>
+
+                <!-- Right: Interactive Terminal -->
+                <section class="panel terminal-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title">
+                            <span class="panel-icon">⌘</span>
+                            <span id="interaction-title">Select an Agent</span>
+                        </h2>
+                        <span class="selected-agent-id" id="selected-agent-badge"></span>
+                    </div>
+
+                    <!-- Terminal Output -->
+                    <div class="terminal" id="terminal">
+                        <div class="terminal-output" id="terminal-output">
+                            <div class="terminal-welcome">
+                                <pre class="ascii-art">
+ ╔═══════════════════════════════════════╗
+ ║     C 2   P R O J E C T               ║
+ ║     Command & Control Framework       ║
+ ╚═══════════════════════════════════════╝</pre>
+                                <p class="welcome-text">Select an agent to begin issuing commands.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Command Input -->
+                    <div class="command-bar" id="command-bar">
+                        <span class="prompt-symbol">❯</span>
+                        <input type="text" id="command-input" class="command-input" placeholder="Enter command…"
+                            autocomplete="off" disabled>
+                        <button class="btn-send" id="send-btn" disabled onclick="sendCommand()">
+                            EXEC ⏎
+                        </button>
+                        <button class="btn-send-file" id="send-file-btn" disabled
+                            onclick="document.getElementById('send-file-input').click()"
+                            title="Send a file to the agent">
+                            📁 Send File
+                        </button>
+                        <input type="file" id="send-file-input" style="display:none" onchange="sendFileToAgent(this)">
+                    </div>
+
+                    <!-- Task History (Collapsible) -->
+                    <div class="task-history-section">
+                        <button class="task-history-toggle" id="task-toggle" onclick="toggleTaskHistory()">
+                            <span class="panel-icon">☰</span> Task History
+                            <span class="toggle-arrow" id="toggle-arrow">▾</span>
+                        </button>
+                        <div class="task-list collapsed" id="task-list">
+                            <div class="empty-state small">
+                                <p>No tasks yet</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Loot (Exfiltrated Files) -->
+                    <div class="task-history-section">
+                        <button class="task-history-toggle" onclick="toggleLoot()">
+                            <span class="panel-icon">🗃</span> Exfiltrated Files (Loot)
+                            <span class="toggle-arrow" id="loot-toggle-arrow">▾</span>
+                        </button>
+                        <div class="loot-list collapsed" id="loot-list">
+                            <div class="empty-state small">
+                                <p>No files exfiltrated yet</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </section>
+
+        <!-- ════════════════════════════════════════ -->
+        <!--  SECTION: Deploy                        -->
+        <!-- ════════════════════════════════════════ -->
+        <section class="section" id="section-deploy">
+
+            <div class="deploy-layout">
+
+                <!-- Build Form -->
+                <div class="panel deploy-form-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title">
+                            <span class="panel-icon">⚙</span> Build Agent Payload
+                        </h2>
+                    </div>
+
+                    <form class="build-form" id="build-form" onsubmit="buildAgent(event)">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label" for="build-os">Target OS</label>
+                                <select class="form-select" id="build-os">
+                                    <option value="windows">🪟 Windows</option>
+                                    <option value="linux">🐧 Linux</option>
+                                    <option value="mac">🍎 macOS</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="build-arch">Architecture</label>
+                                <select class="form-select" id="build-arch">
+                                    <option value="amd64">x86_64 (amd64)</option>
+                                    <option value="arm64">ARM64</option>
+                                    <option value="386">x86 (32-bit)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="build-url">Server Callback URL</label>
+                            <input type="text" class="form-input" id="build-url" placeholder="http://192.168.1.100:5000"
+                                value="http://localhost:5000">
+                            <span class="form-hint">The address the agent will phone home to</span>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label" for="build-interval">Callback Interval (seconds)</label>
+                                <input type="number" class="form-input" id="build-interval" value="10" min="1"
+                                    max="3600">
+                                <span class="form-hint">How often the agent checks in</span>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Persistence</label>
+                                <div class="toggle-wrapper">
+                                    <label class="toggle">
+                                        <input type="checkbox" id="build-persist">
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                    <span class="toggle-label" id="persist-label">Disabled</span>
+                                </div>
+                                <span class="form-hint">Auto-start agent on reboot</span>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="btn-build" id="build-btn">
+                            <span class="btn-build-icon">⚡</span>
+                            <span class="btn-build-text">BUILD & DOWNLOAD</span>
+                        </button>
+                    </form>
+
+                    <!-- Build Progress -->
+                    <div class="build-progress hidden" id="build-progress">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progress-fill"></div>
+                        </div>
+                        <p class="progress-text" id="progress-text">Compiling agent…</p>
+                    </div>
+                </div>
+
+                <!-- Generated Payloads -->
+                <div class="panel payloads-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title">
+                            <span class="panel-icon">📦</span> Generated Payloads
+                        </h2>
+                        <button class="btn-icon" id="refresh-builds" onclick="loadBuilds()" title="Refresh">⟳</button>
+                    </div>
+                    <div class="payload-list" id="payload-list">
+                        <div class="empty-state">
+                            <span class="empty-icon">📦</span>
+                            <p>No payloads generated yet</p>
+                            <p class="empty-sub">Build your first agent above</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Staging (push files to agents) -->
+                <div class="panel stage-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title">
+                            <span class="panel-icon">📤</span> Stage Files
+                        </h2>
+                        <button class="btn-icon" onclick="loadStagedFiles()" title="Refresh">⟳</button>
+                    </div>
+                    <p class="panel-sub">Upload files here, then push them to an agent with:
+                        <code>download &lt;ID&gt; &lt;save_path&gt;</code>
+                    </p>
+                    <div class="stage-upload-row">
+                        <input type="file" id="stage-file-input" class="stage-file-input">
+                        <button class="btn-stage" id="stage-btn" onclick="stageFile()">📤 Upload &amp; Stage</button>
+                    </div>
+                    <div class="staged-file-list" id="staged-file-list">
+                        <div class="empty-state small">
+                            <p>No files staged</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+
+</html>
