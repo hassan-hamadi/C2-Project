@@ -65,24 +65,19 @@ Operator (Dashboard)
 | File Staging | Operator uploads files via dashboard. Agent pulls by numeric ID on command. |
 | Agent Management | Registration on first check-in, `last_seen` update on subsequent check-ins, cascading purge on self-destruct. |
 
-### Known Detection Surfaces
+### Evasion Status
 
-All of these are documented in detail in the blog post. Summary:
+Tracks every known detection surface, what the fix is, and whether it has been implemented yet.
 
-- **Network Analysis:** Fixed-interval beaconing with zero jitter. Network analysis (RITA, Zeek) flags it immediately.
-- **Process tree artifacts.** Every command spawns `cmd.exe`/`sh` as a child process. EDR process tree heuristics catch this pattern.
-- **Loud persistence.** `reg.exe` writes to the most monitored registry key in Windows. The value name is a hardcoded string.
-- **Plaintext HTTP.** All traffic is unencrypted with the default `Go-http-client/1.1` User-Agent. Predictable URL paths (`/api/checkin`, `/api/result`).
-- **No server authentication.** Every endpoint is open. Anyone who finds the server can enumerate agents, submit tasks, or download loot.
-- **String literals in binary.** API paths, server URL, and persistence names are all visible via `strings`.
-
-## Planned Evasion (Phase 2)
-
-**Network layer:** Jitter and beacon randomization to break frequency analysis. HTTPS with certificate pinning. AES-256-GCM payload encryption (opaque even to TLS-intercepting proxies). User-Agent spoofing and randomized API endpoint paths at build time.
-
-**Host layer:** Direct Windows API syscalls (`FindFirstFile`, `GetUserNameW`, `RegSetValueExW`) to eliminate `cmd.exe` process trees. Stealthier persistence via COM object hijacking, `ITaskService` COM scheduled tasks, or DLL search order hijacking. In-memory payload execution to avoid writing to disk.
-
-**Server layer:** API key authentication on all endpoints. Flask debug mode disabled. SQLite database encrypted at rest. Mutual TLS for agent-to-server verification.
+| Surface | Risk | Status | Fix |
+|---|---|---|---|
+| Beacon frequency | Fixed-interval polling is trivially flagged by most network analysis software | ✅ Fixed | Range-based jitter, where the agent sleeps a random duration between `JitterMin` and `JitterMax` each cycle |
+| Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | 🔴 Open | Direct Windows API syscalls (`CreateProcess`, `ShellExecute`) to cut out the shell middleman |
+| Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
+| Plaintext HTTP | All traffic is unencrypted with the default `Go-http-client/1.1` User-Agent | 🔴 Open | HTTPS with certificate pinning, AES-256-GCM payload encryption, User-Agent spoofing |
+| Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | 🔴 Open | Randomise API paths at build time via the payload builder |
+| No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | 🔴 Open | API key auth on all endpoints, mutual TLS for agent-to-server trust |
+| Strings in binary | Server URL, API paths, and persistence names are all visible via `strings` | 🔴 Open | Symbol stripping is already done (`-s -w`); compile-time obfuscation for string literals is next |
 
 ## Project Structure
 
@@ -175,9 +170,9 @@ The `-count=1` flag bypasses Go's test result cache so each run is always fresh.
 | `POST` | `/api/result` | Task result submission |
 | `POST` | `/api/task` | Queue a command for an agent |
 | `POST` | `/api/upload` | Receive exfiltrated file from agent |
-| `POST` | `/api/build` | Compile a new agent binary — accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence` |
+| `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence` |
 | `GET` | `/api/agents` | List all registered agents |
-| `GET` | `/api/agents/<id>` | _(not implemented — use DELETE variants)_ |
+| `GET` | `/api/agents/<id>` | _(not implemented, use DELETE variants)_ |
 | `DELETE` | `/api/agents/<id>` | Queue self-destruct for agent |
 | `DELETE` | `/api/agents/<id>/force` | Force-remove agent from database |
 | `GET` | `/api/tasks/<agent_id>` | Get task history for an agent |
