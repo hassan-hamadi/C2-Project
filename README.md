@@ -46,7 +46,7 @@ Operator (Dashboard)
 
 | Capability | Implementation |
 |---|---|
-| HTTP Beaconing | Fixed-interval polling via `time.Sleep`. Agent POSTs identity, receives task array. |
+| HTTP Beaconing | Range-based jitter: sleeps a random duration uniformly sampled between `JitterMin` and `JitterMax` each cycle. Agent POSTs identity, receives task array. |
 | Command Execution | Dispatches to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS) per task. |
 | Stateful `cd` | Intercepts `cd` commands before the shell. Tracks working directory in-process via a `CurrentDir` global. Subsequent commands inherit it through `cmd.Dir`. |
 | File Exfiltration | `get <path>` reads target file and POSTs as `multipart/form-data` to the server. |
@@ -59,7 +59,7 @@ Operator (Dashboard)
 
 | Capability | Implementation |
 |---|---|
-| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. |
+| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. Beacon timing is baked into the binary as a `JitterMin`/`JitterMax` range (no config file on disk). |
 | Task Queue | SQLite-backed state machine: `pending` > `sent` > `complete`. Tasks are bundled into the check-in response and marked `sent` on retrieval. |
 | Loot Storage | Exfiltrated files saved with timestamp prefix. Metadata recorded in `loot` table. |
 | File Staging | Operator uploads files via dashboard. Agent pulls by numeric ID on command. |
@@ -126,7 +126,7 @@ From the dashboard, navigate to Deploy and configure:
 - **Target OS:** `windows`, `linux`, or `MacOS`
 - **Architecture:** `amd64`, `arm64`, or `386`
 - **Server URL:** Callback address for the agent
-- **Interval:** Check-in frequency in seconds
+- **Jitter range:** Min and max beacon interval in seconds (agent picks randomly within the range)
 - **Persistence:** Enable or disable boot persistence
 
 Click Build. The server compiles the agent with the specified configuration and returns the binary for download.
@@ -140,14 +140,31 @@ curl -X POST http://localhost:5000/api/build \
     "target_os": "windows",
     "arch": "amd64",
     "server_url": "http://<YOUR_SERVER>:5000",
-    "interval": "30",
+    "jitter_min": "8",
+    "jitter_max": "30",
     "persistence": false
   }'
 ```
 
 ### Run the Agent
 
-Execute the compiled binary on the target host. It will generate a UUID, begin checking in at the configured interval, and appear in the dashboard.
+Execute the compiled binary on the target host. It will generate a UUID, begin checking in at the configured jitter range, and appear in the dashboard.
+
+## Testing
+
+The agent package includes unit tests for the jitter implementation. Run them from the `agent/` directory.
+
+```bash
+cd agent
+
+# Run all tests
+go test ./funcs/ -v -count=1
+
+# Run only the jitter tests
+go test ./funcs/ -v -count=1 -run "TestRandomDuration|TestSleepWithJitter"
+```
+
+The `-count=1` flag bypasses Go's test result cache so each run is always fresh. This matters for the distribution test, which draws new random samples every time.
 
 ## API Reference
 
@@ -158,16 +175,23 @@ Execute the compiled binary on the target host. It will generate a UUID, begin c
 | `POST` | `/api/result` | Task result submission |
 | `POST` | `/api/task` | Queue a command for an agent |
 | `POST` | `/api/upload` | Receive exfiltrated file from agent |
-| `POST` | `/api/build` | Compile a new agent binary |
+| `POST` | `/api/build` | Compile a new agent binary — accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence` |
 | `GET` | `/api/agents` | List all registered agents |
+| `GET` | `/api/agents/<id>` | _(not implemented — use DELETE variants)_ |
 | `DELETE` | `/api/agents/<id>` | Queue self-destruct for agent |
 | `DELETE` | `/api/agents/<id>/force` | Force-remove agent from database |
 | `GET` | `/api/tasks/<agent_id>` | Get task history for an agent |
 | `GET` | `/api/results/<task_id>` | Get output for a specific task |
+| `GET` | `/api/builds` | List all compiled payloads |
+| `GET` | `/api/builds/download/<id>` | Download a compiled agent binary |
+| `DELETE` | `/api/builds/<id>` | Delete a build record and its file |
 | `POST` | `/api/files/stage` | Upload a file for agent download |
-| `GET` | `/api/files/<id>` | Agent fetches a staged file |
+| `GET` | `/api/files` | List all staged files |
+| `GET` | `/api/files/<id>` | Agent fetches a staged file by ID |
+| `DELETE` | `/api/files/<id>` | Delete a staged file |
 | `GET` | `/api/loot` | List exfiltrated files |
 | `GET` | `/api/loot/download/<id>` | Download an exfiltrated file |
+| `DELETE` | `/api/loot/<id>` | Delete an exfiltrated file |
 | `GET` | `/api/stats` | Dashboard statistics |
 
 ## License

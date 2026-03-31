@@ -284,17 +284,29 @@ function buildAgent(event) {
     const progressEl = document.getElementById("build-progress");
     const progressText = document.getElementById("progress-text");
 
+    const jitterMin = parseInt(document.getElementById("build-jitter-min").value, 10);
+    const jitterMax = parseInt(document.getElementById("build-jitter-max").value, 10);
+
     const config = {
         target_os: document.getElementById("build-os").value,
         arch: document.getElementById("build-arch").value,
         server_url: document.getElementById("build-url").value.trim(),
-        interval: document.getElementById("build-interval").value,
+        jitter_min: jitterMin,
+        jitter_max: jitterMax,
         persistence: document.getElementById("build-persist").checked,
     };
 
     // Validate
     if (!config.server_url) {
         alert("Server URL is required");
+        return;
+    }
+    if (isNaN(jitterMin) || isNaN(jitterMax) || jitterMin < 1 || jitterMax > 3600) {
+        alert("Jitter values must be between 1 and 3600 seconds");
+        return;
+    }
+    if (jitterMin >= jitterMax) {
+        alert("Jitter Min must be less than Jitter Max");
         return;
     }
 

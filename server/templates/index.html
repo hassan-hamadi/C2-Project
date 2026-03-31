@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>C2 — Command & Control</title>
+    <title>C2 - Command & Control</title>
     <meta name="description" content="C2 Command and Control Dashboard">
     <link rel="stylesheet" href="/static/style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -218,11 +218,20 @@
 
                         <div class="form-row">
                             <div class="form-group">
-                                <label class="form-label" for="build-interval">Callback Interval (seconds)</label>
-                                <input type="number" class="form-input" id="build-interval" value="10" min="1"
-                                    max="3600">
-                                <span class="form-hint">How often the agent checks in</span>
+                                <label class="form-label" for="build-jitter-min">Jitter Min (seconds)</label>
+                                <input type="number" class="form-input" id="build-jitter-min" value="8" min="1"
+                                    max="3599">
+                                <span class="form-hint">Shortest possible beacon interval</span>
                             </div>
+                            <div class="form-group">
+                                <label class="form-label" for="build-jitter-max">Jitter Max (seconds)</label>
+                                <input type="number" class="form-input" id="build-jitter-max" value="15" min="2"
+                                    max="3600">
+                                <span class="form-hint">Longest possible beacon interval</span>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label">Persistence</label>
                                 <div class="toggle-wrapper">
