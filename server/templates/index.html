@@ -233,6 +233,26 @@
 
                         <div class="form-row">
                             <div class="form-group">
+                                <label class="form-label" for="build-profile">Browser Profile</label>
+                                <select class="form-select" id="build-profile">
+                                    <option value="1">🌐 Chrome / Windows</option>
+                                    <option value="2">🌐 Chrome / Linux</option>
+                                    <option value="3">🦊 Firefox / Windows</option>
+                                    <option value="4">🦊 Firefox / Linux</option>
+                                    <option value="5">🍎 Safari / macOS</option>
+                                </select>
+                                <span class="form-hint">Browser identity the agent will impersonate on the wire</span>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="build-locale">Locale (Accept-Language)</label>
+                                <input type="text" class="form-input" id="build-locale" value="en-US,en;q=0.9"
+                                    placeholder="en-US,en;q=0.9">
+                                <span class="form-hint">Match the target environment's language baseline</span>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
                                 <label class="form-label">Persistence</label>
                                 <div class="toggle-wrapper">
                                     <label class="toggle">

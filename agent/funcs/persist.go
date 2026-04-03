@@ -48,7 +48,7 @@ func persistWindows(exePath string) error {
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("registry add failed: %s — %w", string(output), err)
+		return fmt.Errorf("registry add failed: %s - %w", string(output), err)
 	}
 
 	fmt.Printf("[+] Persistence installed (Windows registry): %s\n", PersistName)
@@ -64,7 +64,7 @@ func removePersistWindows() error {
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("registry delete failed: %s — %w", string(output), err)
+		return fmt.Errorf("registry delete failed: %s - %w", string(output), err)
 	}
 
 	fmt.Printf("[-] Persistence removed (Windows registry): %s\n", PersistName)
@@ -88,7 +88,7 @@ func persistLinux(exePath string) error {
 	installCmd.Stdin = strings.NewReader(newCron)
 	output, err := installCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("crontab install failed: %s — %w", string(output), err)
+		return fmt.Errorf("crontab install failed: %s - %w", string(output), err)
 	}
 
 	fmt.Printf("[+] Persistence installed (Linux cron): @reboot %s\n", exePath)
@@ -123,7 +123,7 @@ func removePersistLinux() error {
 	installCmd.Stdin = strings.NewReader(newCron)
 	output, installErr := installCmd.CombinedOutput()
 	if installErr != nil {
-		return fmt.Errorf("crontab update failed: %s — %w", string(output), installErr)
+		return fmt.Errorf("crontab update failed: %s - %w", string(output), installErr)
 	}
 
 	fmt.Printf("[-] Persistence removed (Linux cron): %s\n", PersistName)

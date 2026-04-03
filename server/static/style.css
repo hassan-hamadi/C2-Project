@@ -3,7 +3,7 @@
    Dark theme with cyan/teal accents
    ═══════════════════════════════════════════════════ */
 
-/* ─── CSS Variables / Design Tokens ─── */
+/* Variables / Design Tokens */
 :root {
     /* Background layers */
     --bg-base: #06060a;
@@ -372,7 +372,7 @@ body {
 }
 
 /* ═══════════════════════════════════════════
-   CONTROL SECTION — TWO-COLUMN LAYOUT
+   CONTROL SECTION - TWO-COLUMN LAYOUT
    ═══════════════════════════════════════════ */
 
 .control-layout {

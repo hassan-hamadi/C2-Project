@@ -47,6 +47,7 @@ Operator (Dashboard)
 | Capability | Implementation |
 |---|---|
 | HTTP Beaconing | Range-based jitter: sleeps a random duration uniformly sampled between `JitterMin` and `JitterMax` each cycle. Agent POSTs identity, receives task array. |
+| Browser Profile Spoofing | Compile-time browser profile selection. A `UATransport` RoundTripper intercepts every outbound request and injects a full, validated header set matching one of five real browser fingerprints (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS). |
 | Command Execution | Dispatches to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS) per task. |
 | Stateful `cd` | Intercepts `cd` commands before the shell. Tracks working directory in-process via a `CurrentDir` global. Subsequent commands inherit it through `cmd.Dir`. |
 | File Exfiltration | `get <path>` reads target file and POSTs as `multipart/form-data` to the server. |
@@ -59,7 +60,7 @@ Operator (Dashboard)
 
 | Capability | Implementation |
 |---|---|
-| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. Beacon timing is baked into the binary as a `JitterMin`/`JitterMax` range (no config file on disk). |
+| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. Beacon timing is baked into the binary as a `JitterMin`/`JitterMax` range (no config file on disk). Browser profile ID and locale are injected at compile time. |
 | Task Queue | SQLite-backed state machine: `pending` > `sent` > `complete`. Tasks are bundled into the check-in response and marked `sent` on retrieval. |
 | Loot Storage | Exfiltrated files saved with timestamp prefix. Metadata recorded in `loot` table. |
 | File Staging | Operator uploads files via dashboard. Agent pulls by numeric ID on command. |
@@ -72,9 +73,11 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Surface | Risk | Status | Fix |
 |---|---|---|---|
 | Beacon frequency | Fixed-interval polling is trivially flagged by most network analysis software | ✅ Fixed | Range-based jitter, where the agent sleeps a random duration between `JitterMin` and `JitterMax` each cycle |
+| User-Agent fingerprint | Default `Go-http-client/1.1` User-Agent is a high-confidence IOC; mismatched headers create detectable "HTTP chimeras" | ✅ Fixed | Five validated browser profiles (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS) applied via a `UATransport` RoundTripper. Each profile includes the correct UA string, `Sec-Ch-Ua` client hints, `Sec-Fetch-*` metadata, and `Accept` values, matching the April 2026 browser baseline |
 | Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | 🔴 Open | Direct Windows API syscalls (`CreateProcess`, `ShellExecute`) to cut out the shell middleman |
 | Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
-| Plaintext HTTP | All traffic is unencrypted with the default `Go-http-client/1.1` User-Agent | 🔴 Open | HTTPS with certificate pinning, AES-256-GCM payload encryption, User-Agent spoofing |
+| Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | 🔴 Open | AES-256-GCM payload encryption with per-session key exchange |
+| Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | 🔴 Open | HTTPS with certificate pinning |
 | Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | 🔴 Open | Randomise API paths at build time via the payload builder |
 | No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | 🔴 Open | API key auth on all endpoints, mutual TLS for agent-to-server trust |
 | Strings in binary | Server URL, API paths, and persistence names are all visible via `strings` | 🔴 Open | Symbol stripping is already done (`-s -w`); compile-time obfuscation for string literals is next |
@@ -91,7 +94,8 @@ C2-Project/
 │       ├── shell.go          # Command execution, cd state tracking
 │       ├── transfer.go       # File exfiltration and download
 │       ├── persist.go        # Registry/cron persistence
-│       └── selfdestruct.go   # Binary deletion and DB purge
+│       ├── selfdestruct.go   # Binary deletion and DB purge
+│       └── ua.go             # Browser profile spoofing (UATransport + 5 profiles)
 ├── server/
 │   ├── app.py               # Flask API, build pipeline, task management
 │   ├── database.py          # SQLite schema and connection handling
@@ -170,7 +174,7 @@ The `-count=1` flag bypasses Go's test result cache so each run is always fresh.
 | `POST` | `/api/result` | Task result submission |
 | `POST` | `/api/task` | Queue a command for an agent |
 | `POST` | `/api/upload` | Receive exfiltrated file from agent |
-| `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence` |
+| `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence`, `profile_id` (1-5), `locale` |
 | `GET` | `/api/agents` | List all registered agents |
 | `GET` | `/api/agents/<id>` | _(not implemented, use DELETE variants)_ |
 | `DELETE` | `/api/agents/<id>` | Queue self-destruct for agent |

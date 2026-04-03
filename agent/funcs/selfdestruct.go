@@ -29,7 +29,7 @@ func SelfDestruct() {
 
 	switch runtime.GOOS {
 	case "windows":
-		// Can't delete a running .exe on Windows — write a batch script that
+		// Can't delete a running .exe on Windows, write a batch script that
 		// waits for the process to exit, deletes the exe, then deletes itself.
 		batPath := exePath + "_cleanup.bat"
 		batContent := fmt.Sprintf("@echo off\r\n:loop\r\ntimeout /t 2 /nobreak >nul\r\ndel /f /q \"%s\"\r\nif exist \"%s\" goto loop\r\ndel /f /q \"%s\"\r\n", exePath, exePath, batPath)

