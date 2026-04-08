@@ -127,32 +127,28 @@ func checkIn(hostname, agentOS string) ([]Task, error) {
 		OS:       agentOS,
 	}
 
-	body, err := json.Marshal(payload)
+	respBody, err := encryptedPost(ServerURL+"/api/checkin", payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshal error: %w", err)
+		return nil, err
 	}
 
-	resp, err := http.Post(
-		ServerURL+"/api/checkin",
-		"application/json",
-		bytes.NewBuffer(body),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("request error: %w", err)
+	// Unwrap the encrypted response envelope
+	var envelope struct {
+		Data string `json:"data"`
 	}
-	defer resp.Body.Close()
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		return nil, fmt.Errorf("envelope unmarshal: %w", err)
+	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	plain, err := funcs.Decrypt(EncryptionKey, envelope.Data)
 	if err != nil {
-		return nil, fmt.Errorf("read error: %w", err)
+		return nil, fmt.Errorf("decrypt checkin response: %w", err)
 	}
 
 	var result CheckInResponse
-	err = json.Unmarshal(respBody, &result)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal error: %w", err)
+	if err := json.Unmarshal(plain, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
-
 	return result.Tasks, nil
 }
 
@@ -161,21 +157,34 @@ func sendResult(taskID int, output string) error {
 		TaskID: taskID,
 		Output: output,
 	}
+	_, err := encryptedPost(ServerURL+"/api/result", payload)
+	return err
+}
 
-	body, err := json.Marshal(payload)
+// encryptedPost JSON-encodes payload, encrypts it with AES-256-GCM,
+// wraps the ciphertext in a {kid, data} envelope, and POSTs it.
+// Returns the raw response body so the caller can decrypt if needed.
+func encryptedPost(url string, payload any) ([]byte, error) {
+	inner, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal error: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
-	resp, err := http.Post(
-		ServerURL+"/api/result",
-		"application/json",
-		bytes.NewBuffer(body),
-	)
+	enc, err := funcs.Encrypt(EncryptionKey, inner)
 	if err != nil {
-		return fmt.Errorf("request error: %w", err)
+		return nil, fmt.Errorf("encrypt: %w", err)
+	}
+
+	envelope := map[string]string{"kid": KeyID, "data": enc}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("envelope marshal: %w", err)
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return nil, fmt.Errorf("post: %w", err)
 	}
 	defer resp.Body.Close()
-
-	return nil
+	return io.ReadAll(resp.Body)
 }

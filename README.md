@@ -47,7 +47,7 @@ Operator (Dashboard)
 | Capability | Implementation |
 |---|---|
 | HTTP Beaconing | Range-based jitter: sleeps a random duration uniformly sampled between `JitterMin` and `JitterMax` each cycle. Agent POSTs identity, receives task array. |
-| Browser Profile Spoofing | Compile-time browser profile selection. A `UATransport` RoundTripper intercepts every outbound request and injects a full, validated header set matching one of five real browser fingerprints (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS). |
+| Browser Profile Spoofing | Compile-time browser profile selection. A `UATransport` RoundTripper intercepts every outbound request and injects a full, validated header set matching one of five real browser fingerprints (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS). The transport automatically switches between navigation context (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) for page loads and fetch context (`cors`, `empty`, `same-origin`) for JSON POST requests, matching what a real browser would send for each request type. |
 | Command Execution | Dispatches to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS) per task. |
 | Stateful `cd` | Intercepts `cd` commands before the shell. Tracks working directory in-process via a `CurrentDir` global. Subsequent commands inherit it through `cmd.Dir`. |
 | File Exfiltration | `get <path>` reads target file and POSTs as `multipart/form-data` to the server. |
@@ -73,10 +73,11 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Surface | Risk | Status | Fix |
 |---|---|---|---|
 | Beacon frequency | Fixed-interval polling is trivially flagged by most network analysis software | ✅ Fixed | Range-based jitter, where the agent sleeps a random duration between `JitterMin` and `JitterMax` each cycle |
-| User-Agent fingerprint | Default `Go-http-client/1.1` User-Agent is a high-confidence IOC; mismatched headers create detectable "HTTP chimeras" | ✅ Fixed | Five validated browser profiles (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS) applied via a `UATransport` RoundTripper. Each profile includes the correct UA string, `Sec-Ch-Ua` client hints, `Sec-Fetch-*` metadata, and `Accept` values, matching the April 2026 browser baseline |
+| User-Agent fingerprint | Default `Go-http-client/1.1` User-Agent is a high-confidence IOC; mismatched headers create detectable "HTTP chimeras". Using a placeholder version like `Chrome/147.0.0.0` is itself a fingerprinting tell, real Chrome never ships as `X.0.0.0`. Sending `Sec-Fetch-Mode: navigate` on a JSON POST is a logical impossibility that real browsers never produce | ✅ Fixed | Five validated browser profiles (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS) applied via a `UATransport` RoundTripper. Each profile includes the correct UA string, `Sec-Ch-Ua` client hints, `Sec-Fetch-*` metadata, and `Accept` values matching the April 2026 browser baseline. Chrome profiles use the real stable build string (`147.0.7727.55`) and the correct `Not-A.Brand` version (`v="24"`), not the placeholder `X.0.0.0` / `v="99"` pattern that fingerprinting tools flag. The transport layer automatically switches to fetch context (`Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Sec-Fetch-Site: same-origin`) on POST requests and drops navigation-only headers (`Upgrade-Insecure-Requests`, `Sec-Fetch-User`) that would be anomalous on a JSON API call |
 | Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | 🔴 Open | Direct Windows API syscalls (`CreateProcess`, `ShellExecute`) to cut out the shell middleman |
 | Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
-| Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | 🔴 Open | AES-256-GCM payload encryption with per-session key exchange |
+| Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | ✅ Fixed | AES-256-GCM with a per-build pre-shared key. The server generates a fresh 32-byte key at build time, injects it into the agent binary as a compile-time constant (`EncryptionKey`), and stores it in the `builds` table alongside a non-secret 8-char fingerprint (`key_id`). Every `POST /api/checkin` and `POST /api/result` body uses the `{"kid": "...", "data": "<base64(nonce+ciphertext+tag)>"}` envelope. The GCM authentication tag prevents both tampering and replay of individual messages. |
+| Server response header | `Server: Werkzeug/3.x Python/3.x` response header immediately identifies the C2 server as a Flask application to any analyst inspecting traffic | ✅ Fixed | `@after_request` hook in `app.py` replaces the header with `Server: nginx/1.24.0` on every response, including error pages |
 | Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | 🔴 Open | HTTPS with certificate pinning |
 | Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | 🔴 Open | Randomise API paths at build time via the payload builder |
 | No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | 🔴 Open | API key auth on all endpoints, mutual TLS for agent-to-server trust |
@@ -91,6 +92,9 @@ C2-Project/
 │   ├── config.go            # Compile-time configuration, UUID generation
 │   ├── go.mod
 │   └── funcs/
+│       ├── crypto.go         # AES-256-GCM encrypt/decrypt helpers
+│       ├── jitter.go         # Random sleep duration within a min/max range
+│       ├── jitter_test.go    # Unit tests for jitter distribution and bounds
 │       ├── shell.go          # Command execution, cd state tracking
 │       ├── transfer.go       # File exfiltration and download
 │       ├── persist.go        # Registry/cron persistence
@@ -98,6 +102,7 @@ C2-Project/
 │       └── ua.go             # Browser profile spoofing (UATransport + 5 profiles)
 ├── server/
 │   ├── app.py               # Flask API, build pipeline, task management
+│   ├── crypto.py            # AES-256-GCM encryption, key generation
 │   ├── database.py          # SQLite schema and connection handling
 │   ├── templates/
 │   │   └── index.html        # Operator dashboard

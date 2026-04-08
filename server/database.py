@@ -59,9 +59,18 @@ def init_db():
             persistence INTEGER DEFAULT 0,
             file_path TEXT NOT NULL,
             file_size INTEGER DEFAULT 0,
+            key_id TEXT,
+            encryption_key TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Add columns for encryption key storage (safe to re-run, ignores if they exist)
+    for _col, _coltype in [("key_id", "TEXT"), ("encryption_key", "TEXT")]:
+        try:
+            cursor.execute(f"ALTER TABLE builds ADD COLUMN {_col} {_coltype}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS loot (

