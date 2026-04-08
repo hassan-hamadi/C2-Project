@@ -1118,4 +1118,4 @@ if __name__ == "__main__":
     WSGIRequestHandler.server_version = "nginx/1.24.0"
     WSGIRequestHandler.sys_version = ""
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
