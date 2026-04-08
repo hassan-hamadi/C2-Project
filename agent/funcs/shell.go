@@ -102,6 +102,11 @@ func ExecuteCommand(command string) (string, error) {
 		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	}
 
+	// Suppress the console window that Windows creates for CUI subprocesses.
+	// The agent binary is built with -H=windowsgui so it has no console, but
+	// each cmd.exe child would still flash a window without this flag.
+	setHideWindow(cmd)
+
 	cmd.Dir = CurrentDir
 
 	output, err := cmd.CombinedOutput()
