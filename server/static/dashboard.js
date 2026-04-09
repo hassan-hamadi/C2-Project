@@ -8,6 +8,66 @@ let selectedAgentId = null;
 let taskHistoryOpen = false;
 const REFRESH_INTERVAL = 5000;
 
+// ═══════════════════════════════════════════
+//  API KEY AUTH
+// ═══════════════════════════════════════════
+
+function apiFetch(url, options = {}) {
+    const key = sessionStorage.getItem("api_key");
+    if (!key) {
+        showAuthOverlay();
+        return Promise.reject(new Error("Not authenticated"));
+    }
+    if (!options.headers) options.headers = {};
+    if (options.headers instanceof Headers) {
+        options.headers.set("X-API-Key", key);
+    } else {
+        options.headers["X-API-Key"] = key;
+    }
+    return fetch(url, options).then(res => {
+        if (res.status === 401) {
+            sessionStorage.removeItem("api_key");
+            showAuthOverlay();
+            return Promise.reject(new Error("Invalid API key"));
+        }
+        return res;
+    });
+}
+
+function showAuthOverlay() {
+    document.getElementById("auth-overlay").classList.add("visible");
+}
+
+function hideAuthOverlay() {
+    document.getElementById("auth-overlay").classList.remove("visible");
+}
+
+function submitApiKey() {
+    const input = document.getElementById("auth-key-input");
+    const error = document.getElementById("auth-error");
+    const key = input.value.trim();
+
+    if (!key) return;
+
+    error.textContent = "";
+
+    // Test the key with a lightweight endpoint
+    fetch("/api/stats", { headers: { "X-API-Key": key } })
+        .then(res => {
+            if (res.status === 401) {
+                error.textContent = "Invalid API key";
+                return;
+            }
+            sessionStorage.setItem("api_key", key);
+            hideAuthOverlay();
+            refreshAgents();
+            loadStats();
+        })
+        .catch(() => {
+            error.textContent = "Connection failed";
+        });
+}
+
 // ─── DOM References ───
 const agentListEl = document.getElementById("agent-list");
 const terminalOutput = document.getElementById("terminal-output");
@@ -50,7 +110,7 @@ function switchSection(sectionName) {
 // ═══════════════════════════════════════════
 
 function loadStats() {
-    fetch("/api/stats")
+    apiFetch("/api/stats")
         .then((res) => res.json())
         .then((data) => {
             document.getElementById("stat-agents").textContent = data.agents || 0;
@@ -120,7 +180,7 @@ function sendCommand() {
     commandInput.value = "";
 
     // Submit task
-    fetch("/api/task", {
+    apiFetch("/api/task", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -148,7 +208,7 @@ function sendCommand() {
 
 function pollForResult(taskId) {
     const poll = setInterval(() => {
-        fetch(`/api/results/${taskId}`)
+        apiFetch(`/api/results/${taskId}`)
             .then((res) => res.json())
             .then((data) => {
                 if (data.results && data.results.length > 0) {
@@ -180,7 +240,7 @@ function toggleTaskHistory() {
 }
 
 function loadTasks(agentId) {
-    fetch(`/api/tasks/${agentId}`)
+    apiFetch(`/api/tasks/${agentId}`)
         .then((res) => res.json())
         .then((data) => {
             if (!data.tasks || data.tasks.length === 0) {
@@ -204,7 +264,7 @@ function loadTasks(agentId) {
 }
 
 function viewTaskResult(taskId) {
-    fetch(`/api/results/${taskId}`)
+    apiFetch(`/api/results/${taskId}`)
         .then((res) => res.json())
         .then((data) => {
             if (data.results && data.results.length > 0) {
@@ -224,7 +284,7 @@ function viewTaskResult(taskId) {
 // ═══════════════════════════════════════════
 
 function refreshAgents() {
-    fetch("/api/agents")
+    apiFetch("/api/agents")
         .then((res) => res.json())
         .then((data) => {
             if (data.agents.length === 0) {
@@ -317,7 +377,7 @@ function buildAgent(event) {
     progressEl.classList.remove("hidden");
     progressText.textContent = `Compiling ${config.target_os}/${config.arch} agent…`;
 
-    fetch("/api/build", {
+    apiFetch("/api/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
@@ -366,7 +426,7 @@ function buildAgent(event) {
 function loadBuilds() {
     const payloadList = document.getElementById("payload-list");
 
-    fetch("/api/builds")
+    apiFetch("/api/builds")
         .then((res) => res.json())
         .then((data) => {
             if (!data.builds || data.builds.length === 0) {
@@ -405,7 +465,7 @@ function downloadBuild(buildId, filename) {
 }
 
 function triggerDownload(buildId, filename) {
-    fetch(`/api/builds/download/${buildId}`)
+    apiFetch(`/api/builds/download/${buildId}`)
         .then((res) => res.blob())
         .then((blob) => {
             const url = window.URL.createObjectURL(blob);
@@ -423,7 +483,7 @@ function triggerDownload(buildId, filename) {
 function deleteBuild(buildId) {
     if (!confirm("Delete this payload?")) return;
 
-    fetch(`/api/builds/${buildId}`, { method: "DELETE" })
+    apiFetch(`/api/builds/${buildId}`, { method: "DELETE" })
         .then((res) => res.json())
         .then(() => {
             loadBuilds();
@@ -435,7 +495,7 @@ function deleteBuild(buildId) {
 function deleteAgent(agentId) {
     if (!confirm("⚠ DESTROY AGENT?\n\nThis will remotely wipe the agent from the host:\n• Remove persistence (registry/cron)\n• Delete the agent binary\n• Agent will self-destruct on next check-in\n\nContinue?")) return;
 
-    fetch(`/api/agents/${agentId}`, { method: "DELETE" })
+    apiFetch(`/api/agents/${agentId}`, { method: "DELETE" })
         .then((res) => res.json())
         .then((data) => {
             // Visually mark the card as destroying
@@ -463,7 +523,7 @@ function deleteAgent(agentId) {
 }
 
 function forceDeleteAgent(agentId) {
-    fetch(`/api/agents/${agentId}/force`, { method: "DELETE" })
+    apiFetch(`/api/agents/${agentId}/force`, { method: "DELETE" })
         .then((res) => res.json())
         .then(() => {
             if (selectedAgentId === agentId) {
@@ -558,7 +618,7 @@ function toggleLoot() {
 
 function loadLoot() {
     const lootList = document.getElementById("loot-list");
-    fetch("/api/loot")
+    apiFetch("/api/loot")
         .then((res) => res.json())
         .then((data) => {
             if (!data.loot || data.loot.length === 0) {
@@ -587,12 +647,28 @@ function loadLoot() {
 }
 
 function downloadLoot(lootId) {
-    window.open(`/api/loot/download/${lootId}`, "_blank");
+    apiFetch(`/api/loot/download/${lootId}`)
+        .then((res) => {
+            const filename = (res.headers.get("Content-Disposition") || "")
+                .match(/filename="?([^"]+)"?/)?.[1] || "loot";
+            return res.blob().then((blob) => ({ blob, filename }));
+        })
+        .then(({ blob, filename }) => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        })
+        .catch((err) => console.error("Loot download failed:", err));
 }
 
 function deleteLoot(lootId) {
     if (!confirm("Delete this exfiltrated file?")) return;
-    fetch(`/api/loot/${lootId}`, { method: "DELETE" })
+    apiFetch(`/api/loot/${lootId}`, { method: "DELETE" })
         .then(() => loadLoot())
         .catch(() => { });
 }
@@ -616,7 +692,7 @@ function stageFile() {
     btn.disabled = true;
     btn.textContent = "Uploading…";
 
-    fetch("/api/files/stage", {
+    apiFetch("/api/files/stage", {
         method: "POST",
         body: formData,
     })
@@ -658,7 +734,7 @@ function sendFileToAgent(input) {
         </div>
     `);
 
-    fetch("/api/files/stage", {
+    apiFetch("/api/files/stage", {
         method: "POST",
         body: formData,
     })
@@ -694,7 +770,7 @@ function sendFileToAgent(input) {
 
 function loadStagedFiles() {
     const list = document.getElementById("staged-file-list");
-    fetch("/api/files")
+    apiFetch("/api/files")
         .then((res) => res.json())
         .then((data) => {
             if (!data.files || data.files.length === 0) {
@@ -722,7 +798,7 @@ function loadStagedFiles() {
 
 function deleteStagedFile(fileId) {
     if (!confirm("Delete this staged file?")) return;
-    fetch(`/api/files/${fileId}`, { method: "DELETE" })
+    apiFetch(`/api/files/${fileId}`, { method: "DELETE" })
         .then(() => loadStagedFiles())
         .catch(() => { });
 }
@@ -769,5 +845,9 @@ setInterval(() => {
 }, REFRESH_INTERVAL);
 
 // ─── Initial Load ───
-refreshAgents();
-loadStats();
+if (!sessionStorage.getItem("api_key")) {
+    showAuthOverlay();
+} else {
+    refreshAgents();
+    loadStats();
+}

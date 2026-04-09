@@ -8,7 +8,7 @@ import (
 )
 
 func WipeLocalCacheAndExit() {
-	fmt.Println("[!] ═══ CACHE PURGE INITIATED ═══")
+	fmt.Println("[!] Purging local cache...")
 
 	fmt.Println("[*] Removing scheduled service…")
 	err := RemoveAutoUpdater()
