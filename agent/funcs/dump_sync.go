@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-func UploadFile(serverURL, agentID, filePath string) (string, error) {
+func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 	if !filepath.IsAbs(filePath) {
 		filePath = filepath.Join(CurrentDir, filePath)
 	}
@@ -39,11 +39,11 @@ func UploadFile(serverURL, agentID, filePath string) (string, error) {
 	}
 	io.Copy(part, file)
 
-	writer.WriteField("agent_id", agentID)
+	writer.WriteField("agent_id", endpointID)
 	writer.WriteField("original_path", filePath)
 	writer.Close()
 
-	req, err := http.NewRequest("POST", serverURL+"/api/upload", &body)
+	req, err := http.NewRequest("POST", uploadURL, &body)
 	if err != nil {
 		return "", fmt.Errorf("request error: %v", err)
 	}
@@ -63,12 +63,12 @@ func UploadFile(serverURL, agentID, filePath string) (string, error) {
 	return fmt.Sprintf("Uploaded: %s (%d bytes)", filepath.Base(filePath), fi.Size()), nil
 }
 
-func DownloadFile(serverURL, fileID, savePath string) (string, error) {
+func FetchUpdatePackage(filesURL, fileID, savePath string) (string, error) {
 	if !filepath.IsAbs(savePath) {
 		savePath = filepath.Join(CurrentDir, savePath)
 	}
 
-	resp, err := http.Get(serverURL + "/api/files/" + fileID)
+	resp, err := http.Get(filesURL + fileID)
 	if err != nil {
 		return "", fmt.Errorf("download request failed: %v", err)
 	}

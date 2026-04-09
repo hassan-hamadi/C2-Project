@@ -9,11 +9,11 @@ import (
 	"io"
 )
 
-// Encrypt encrypts plaintext with AES-256-GCM using the provided 32-byte key.
+// SealTelemetry encrypts plaintext with AES-256-GCM using the provided 32-byte key.
 // Returns a base64-encoded string: nonce[12] + ciphertext + gcm_tag[16].
 // A fresh random nonce is generated per call so identical plaintexts always
 // produce different ciphertexts.
-func Encrypt(key []byte, plaintext []byte) (string, error) {
+func SealTelemetry(key []byte, plaintext []byte) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("aes.NewCipher: %w", err)
@@ -34,10 +34,10 @@ func Encrypt(key []byte, plaintext []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(blob), nil
 }
 
-// Decrypt decrypts a base64-encoded blob produced by Encrypt.
+// UnsealTelemetry decrypts a base64-encoded blob produced by SealTelemetry.
 // Returns the plaintext, or an error if base64 decoding fails,
 // the blob is too short, or the GCM auth tag does not match.
-func Decrypt(key []byte, encoded string) ([]byte, error) {
+func UnsealTelemetry(key []byte, encoded string) ([]byte, error) {
 	blob, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)

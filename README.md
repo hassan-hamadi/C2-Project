@@ -60,7 +60,7 @@ Operator (Dashboard)
 
 | Capability | Implementation |
 |---|---|
-| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. Beacon timing is baked into the binary as a `JitterMin`/`JitterMax` range (no config file on disk). Browser profile ID and locale are injected at compile time. |
+| Dynamic Compilation | Generates custom `config.go` and `main.go`, cross-compiles via `go build` with `GOOS`/`GOARCH` targeting. Strips symbols with `-s -w` ldflags. Windows builds use `-H=windowsgui` to suppress the console. `-trimpath` removes the host build path from debug info and `-buildid=` clears the per-build hash. Beacon timing is baked into the binary as a `JitterMin`/`JitterMax` range (no config file on disk). Browser profile ID and locale are injected at compile time. |
 | Task Queue | SQLite-backed state machine: `pending` > `sent` > `complete`. Tasks are bundled into the check-in response and marked `sent` on retrieval. |
 | Loot Storage | Exfiltrated files saved with timestamp prefix. Metadata recorded in `loot` table. |
 | File Staging | Operator uploads files via dashboard. Agent pulls by numeric ID on command. |
@@ -81,7 +81,9 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | 🔴 Open | HTTPS with certificate pinning |
 | Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | 🔴 Open | Randomise API paths at build time via the payload builder |
 | No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | 🔴 Open | API key auth on all endpoints, mutual TLS for agent-to-server trust |
-| Strings in binary | Server URL, API paths, and persistence names are all visible via `strings` | 🔴 Open | Symbol stripping is already done (`-s -w`); compile-time obfuscation for string literals is next |
+| Function signatures | Agent functions and variables look suspicious to analysts and scanners | ✅ Fixed | Renamed all internal functions and variables to mimic benign enterprise IT software (e.g., `SyncDeviceState` instead of `checkIn`, `InstallAutoUpdater` instead of `persist`). This helps the agent blend into normal endpoint telemetry noise instead of triggering heuristics. |
+| Strings in binary | Server URLs, API paths, and the persistence service name are all visible in plaintext via `strings` or Ghidra | ✅ Fixed | A random 16-byte XOR key is generated at build time by the payload builder. Every sensitive string (server URL, all API paths, the check-in sentinel, the persistence service label) is XOR-encrypted in Python, hex-encoded, and written directly into the generated `config.go` as a string literal. At runtime `funcs.ResolveConfig()` decodes them into memory on first use. Nothing sensitive appears as a printable string in the binary. |
+| Build metadata / compiler footprint | Go embeds source file paths and the module name in binaries. Without extra flags, running `strings` or loading the binary in Ghidra exposes build paths like `C:\Users\<user>\Desktop\repos\C2-Project\agent\funcs\selfdestruct.go` and the original module name | ✅ Fixed | `-trimpath` strips absolute host build paths from debug info at compile time. `-buildid=` clears the per-build hash. Source files in `funcs/` were renamed to match the telemetry cover (`seal.go`, `sync_backoff.go`, `auto_updater.go`, `cache_purge.go`, `dump_sync.go`) so any residual relative paths look benign. The Go module was renamed from `c2-agent` to `endpoint-telemetry`, which is embedded in every Go binary regardless of strip flags. |
 
 ## Project Structure
 
@@ -92,14 +94,15 @@ C2-Project/
 │   ├── config.go            # Compile-time configuration, UUID generation
 │   ├── go.mod
 │   └── funcs/
-│       ├── crypto.go         # AES-256-GCM encrypt/decrypt helpers
-│       ├── jitter.go         # Random sleep duration within a min/max range
-│       ├── jitter_test.go    # Unit tests for jitter distribution and bounds
-│       ├── shell.go          # Command execution, cd state tracking
-│       ├── transfer.go       # File exfiltration and download
-│       ├── persist.go        # Registry/cron persistence
-│       ├── selfdestruct.go   # Binary deletion and DB purge
-│       └── ua.go             # Browser profile spoofing (UATransport + 5 profiles)
+│       ├── seal.go              # AES-256-GCM encrypt/decrypt helpers
+│       ├── config_decode.go     # XOR string decoder used at runtime
+│       ├── sync_backoff.go      # Random sleep duration within a min/max range
+│       ├── sync_backoff_test.go # Unit tests for jitter distribution and bounds
+│       ├── shell.go             # Command execution, cd state tracking
+│       ├── dump_sync.go         # File exfiltration and download
+│       ├── auto_updater.go      # Registry/cron persistence
+│       ├── cache_purge.go       # Binary deletion and DB purge
+│       └── ua.go                # Browser profile spoofing (UATransport + 5 profiles)
 ├── server/
 │   ├── app.py               # Flask API, build pipeline, task management
 │   ├── crypto.py            # AES-256-GCM encryption, key generation

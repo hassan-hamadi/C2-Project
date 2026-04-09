@@ -1,3 +1,3 @@
-module c2-agent
+module endpoint-telemetry
 
-go 1.21
+go 1.25.9
