@@ -48,6 +48,10 @@
                 <span class="nav-icon">⚙</span>
                 <span class="nav-label">Deploy</span>
             </button>
+            <button class="nav-item" data-section="tls" id="nav-tls" onclick="switchSection('tls')">
+                <span class="nav-icon">🔒</span>
+                <span class="nav-label">TLS</span>
+            </button>
         </div>
 
         <div class="sidebar-footer">
@@ -331,6 +335,81 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </section>
+
+        <!-- ════════════════════════════════════════ -->
+        <!--  SECTION: TLS                           -->
+        <!-- ════════════════════════════════════════ -->
+        <section class="section" id="section-tls">
+            <div class="tls-layout">
+
+                <!-- Left column: Status + Danger -->
+                <div class="tls-left">
+
+                    <!-- Certificate Status -->
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2 class="panel-title"><span class="panel-icon">🔒</span> Certificate Status</h2>
+                            <button class="btn-icon" onclick="loadTlsStatus()" title="Refresh">⟳</button>
+                        </div>
+                        <div id="tls-status-body" class="tls-status-body">
+                            <div class="tls-loading">Loading…</div>
+                        </div>
+                    </div>
+
+                    <!-- Danger Zone -->
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2 class="panel-title"><span class="panel-icon">⚠</span> Danger Zone</h2>
+                        </div>
+                        <div class="tls-danger-body">
+                            <p class="form-hint">Delete the current certificate and key. The server will fall back to HTTP on next restart. All pinned agents will stop connecting.</p>
+                            <button class="btn-delete-cert" id="tls-delete-btn" onclick="deleteCert()">DELETE CERTIFICATE</button>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- Right column: Generate form -->
+                <div class="panel tls-gen-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title"><span class="panel-icon">⚡</span> Generate Certificate</h2>
+                    </div>
+                    <form id="tls-gen-form" class="build-form" onsubmit="generateCert(event)">
+                        <div class="form-group">
+                            <label class="form-label" for="tls-cn">Common Name (CN)</label>
+                            <input class="form-input" type="text" id="tls-cn" placeholder="e.g. 203.0.113.10 or c2.example.com" required>
+                            <span class="form-hint">The primary identifier for the certificate</span>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label" for="tls-san-ips">SAN IP Addresses</label>
+                                <input class="form-input" type="text" id="tls-san-ips" placeholder="e.g. 203.0.113.10">
+                                <span class="form-hint">Comma-separated IPs agents will connect to</span>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="tls-san-dns">SAN DNS Names</label>
+                                <input class="form-input" type="text" id="tls-san-dns" placeholder="e.g. c2.example.com">
+                                <span class="form-hint">Comma-separated hostnames</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="tls-days">Validity (days)</label>
+                            <input class="form-input" type="number" id="tls-days" value="365" min="1" max="3650">
+                            <span class="form-hint">How long the certificate is valid</span>
+                        </div>
+                        <div id="tls-gen-warning" class="tls-overwrite-warning hidden">
+                            <span class="tls-warn-icon">⚠</span> Generating a new certificate will invalidate all agents built with the current pin. They will need to be rebuilt.
+                        </div>
+                        <button type="submit" class="btn-build" id="tls-gen-btn">
+                            <span class="btn-build-icon">⚡</span>
+                            <span class="btn-build-text">GENERATE CERTIFICATE</span>
+                        </button>
+                    </form>
+                    <div id="tls-gen-result" class="tls-gen-result hidden"></div>
+                </div>
+
             </div>
         </section>
 

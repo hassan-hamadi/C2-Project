@@ -378,3 +378,7 @@ $RECYCLE.BIN/
 server/staged/
 server/loot/
 server/builds/
+server/certs/*.pem
+server/certs/*.key
+server/certs/*.crt
+!server/certs/.gitkeep

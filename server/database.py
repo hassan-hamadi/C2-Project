@@ -66,7 +66,7 @@ def init_db():
     """)
 
     # Add columns for encryption key storage (safe to re-run, ignores if they exist)
-    for _col, _coltype in [("key_id", "TEXT"), ("encryption_key", "TEXT")]:
+    for _col, _coltype in [("key_id", "TEXT"), ("encryption_key", "TEXT"), ("cert_pin", "TEXT")]:
         try:
             cursor.execute(f"ALTER TABLE builds ADD COLUMN {_col} {_coltype}")
         except sqlite3.OperationalError:

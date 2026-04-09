@@ -103,6 +103,9 @@ function switchSection(sectionName) {
         loadBuilds();
         loadStagedFiles();
     }
+    if (sectionName === "tls") {
+        loadTlsStatus();
+    }
 }
 
 // ═══════════════════════════════════════════
@@ -396,7 +399,8 @@ function buildAgent(event) {
             }
 
             // Success -> trigger download
-            progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)})`;
+            const tlsTag = data.tls_pinned ? " | TLS pinned" : "";
+            progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)}${tlsTag})`;
             progressText.style.color = "#00e676";
 
             // Auto-download via blob for correct filename
@@ -446,6 +450,7 @@ function loadBuilds() {
                 <div class="payload-item">
                     <span class="payload-name">${escapeHtml(b.filename)}</span>
                     <span class="payload-os-badge">${escapeHtml(b.target_os)} / ${escapeHtml(b.arch)}</span>
+                    ${b.cert_pin ? '<span class="payload-tls-badge">🔒 TLS</span>' : ''}
                     <span class="payload-size">${formatFileSize(b.file_size)}</span>
                     <span class="payload-date">${formatTimestamp(b.created_at)}</span>
                     <div class="payload-actions">
@@ -850,4 +855,156 @@ if (!sessionStorage.getItem("api_key")) {
 } else {
     refreshAgents();
     loadStats();
+}
+
+// ═══════════════════════════════════════════
+//  TLS
+// ═══════════════════════════════════════════
+
+function loadTlsStatus() {
+    const body = document.getElementById("tls-status-body");
+    if (!body) return;
+    body.innerHTML = '<div class="tls-loading">Loading…</div>';
+
+    apiFetch("/api/tls/status")
+        .then((r) => r.json())
+        .then((data) => {
+            if (!data.enabled) {
+                body.innerHTML = `
+                    <div class="tls-status-badge disabled">HTTP ONLY</div>
+                    <p class="form-hint">No certificate found. Generate one to enable HTTPS.</p>
+                    <p class="form-hint" style="margin-top:6px">Agents built with an <code>http://</code> URL will use plain HTTP.</p>`;
+                document.getElementById("tls-gen-warning").classList.add("hidden");
+                return;
+            }
+
+            const c = data.cert;
+            const expiry = new Date(c.not_valid_after);
+            const now = new Date();
+            const daysLeft = Math.ceil((expiry - now) / 86400000);
+            const expiryClass = daysLeft < 30 ? "expiry-warn" : "expiry-ok";
+
+            const sanHtml = c.san.length
+                ? c.san.map((s) => `<span class="tls-san-tag">${escapeHtml(s.type.toUpperCase())}: ${escapeHtml(s.value)}</span>`).join("")
+                : '<span class="tls-san-tag">none</span>';
+
+            body.innerHTML = `
+                <div class="tls-status-badge enabled">HTTPS ACTIVE</div>
+                <div class="tls-cert-grid">
+                    <div class="tls-cert-row">
+                        <span class="tls-cert-label">CN</span>
+                        <span class="tls-cert-value">${escapeHtml(c.cn)}</span>
+                    </div>
+                    <div class="tls-cert-row">
+                        <span class="tls-cert-label">SAN</span>
+                        <span class="tls-cert-value"><div class="tls-san-list">${sanHtml}</div></span>
+                    </div>
+                    <div class="tls-cert-row">
+                        <span class="tls-cert-label">Expires</span>
+                        <span class="tls-cert-value ${expiryClass}">${expiry.toLocaleDateString()} &mdash; ${daysLeft}d remaining</span>
+                    </div>
+                </div>
+                <div class="tls-pin-block">
+                    <span class="tls-cert-label">SPKI Pin (SHA-256)</span>
+                    <code class="tls-pin-code" onclick="copyPin('${escapeHtml(c.spki_pin)}')" title="Click to copy">${escapeHtml(c.spki_pin)}</code>
+                    <span class="tls-restart-note">Click pin to copy &mdash; restart the server after any cert change</span>
+                </div>`;
+
+            document.getElementById("tls-gen-warning").classList.remove("hidden");
+        })
+        .catch(() => {
+            body.innerHTML = '<div class="tls-loading">Failed to load status.</div>';
+        });
+}
+
+function copyPin(pin) {
+    navigator.clipboard.writeText(pin).then(() => {
+        const el = document.querySelector(".tls-pin-code");
+        if (el) {
+            const orig = el.textContent;
+            el.textContent = "Copied!";
+            setTimeout(() => { el.textContent = orig; }, 1500);
+        }
+    });
+}
+
+function generateCert(event) {
+    event.preventDefault();
+
+    const cn      = document.getElementById("tls-cn").value.trim();
+    const sanIpsRaw = document.getElementById("tls-san-ips").value.trim();
+    const sanDnsRaw = document.getElementById("tls-san-dns").value.trim();
+    const days    = parseInt(document.getElementById("tls-days").value, 10);
+
+    const san_ips = sanIpsRaw ? sanIpsRaw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const san_dns = sanDnsRaw ? sanDnsRaw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+
+    const btn    = document.getElementById("tls-gen-btn");
+    const result = document.getElementById("tls-gen-result");
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATING…</span>';
+    result.classList.add("hidden");
+    result.textContent = "";
+
+    apiFetch("/api/tls/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cn, san_ips, san_dns, days }),
+    })
+        .then((r) => r.json())
+        .then((data) => {
+            btn.disabled = false;
+            btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATE CERTIFICATE</span>';
+
+            if (data.error) {
+                result.className = "tls-gen-result error";
+                result.textContent = "Error: " + data.error;
+                result.classList.remove("hidden");
+                return;
+            }
+
+            result.className = "tls-gen-result success";
+            result.innerHTML = `Certificate generated successfully.<br>
+                <strong>SPKI Pin:</strong> <code>${escapeHtml(data.spki_pin)}</code><br>
+                <strong>Expires:</strong> ${new Date(data.not_valid_after).toLocaleDateString()}<br>
+                <span class="tls-restart-note">Restart the server to apply. Rebuild all agents with the new pin.</span>`;
+            result.classList.remove("hidden");
+
+            loadTlsStatus();
+        })
+        .catch((err) => {
+            btn.disabled = false;
+            btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATE CERTIFICATE</span>';
+            result.className = "tls-gen-result error";
+            result.textContent = "Network error: " + err.message;
+            result.classList.remove("hidden");
+        });
+}
+
+function deleteCert() {
+    if (!confirm("Delete the certificate and key? The server will fall back to HTTP on next restart. All pinned agents will stop connecting.")) return;
+
+    const btn = document.getElementById("tls-delete-btn");
+    btn.disabled = true;
+    btn.textContent = "DELETING…";
+
+    apiFetch("/api/tls/delete", { method: "DELETE" })
+        .then((r) => r.json())
+        .then((data) => {
+            btn.disabled = false;
+            btn.textContent = "DELETE CERTIFICATE";
+
+            if (data.error) {
+                alert("Error: " + data.error);
+                return;
+            }
+
+            loadTlsStatus();
+        })
+        .catch((err) => {
+            btn.disabled = false;
+            btn.textContent = "DELETE CERTIFICATE";
+            alert("Network error: " + err.message);
+        });
 }

@@ -1185,6 +1185,19 @@ body {
     white-space: nowrap;
 }
 
+.payload-tls-badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: rgba(0, 230, 118, 0.1);
+    color: #00e676;
+    border: 1px solid rgba(0, 230, 118, 0.3);
+    white-space: nowrap;
+}
+
 .payload-size {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -1646,4 +1659,223 @@ body {
     color: var(--red);
     margin: 0;
     min-height: 16px;
+}
+
+/* ═══════════════════════════════════════════
+   TLS SECTION
+═══════════════════════════════════════════ */
+
+.tls-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.tls-left {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.tls-gen-panel .panel-header {
+    border-bottom: 1px solid var(--border);
+}
+
+/* Status body padding */
+.tls-status-body {
+    padding: 20px 24px;
+}
+
+/* Danger zone body padding */
+.tls-danger-body {
+    padding: 16px 24px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* Loading state */
+.tls-loading {
+    color: var(--text-secondary);
+    font-size: 13px;
+    padding: 4px 0;
+}
+
+/* Status badges — match the payload-os-badge style */
+.tls-status-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    padding: 4px 12px;
+    border-radius: var(--radius-sm);
+    margin-bottom: 16px;
+}
+
+.tls-status-badge.enabled {
+    background: rgba(0, 230, 118, 0.1);
+    color: var(--green);
+    border: 1px solid rgba(0, 230, 118, 0.3);
+}
+
+.tls-status-badge.disabled {
+    background: rgba(255, 82, 82, 0.08);
+    color: var(--red);
+    border: 1px solid rgba(255, 82, 82, 0.25);
+}
+
+/* Cert detail rows */
+.tls-cert-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.tls-cert-row {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 12px;
+    align-items: baseline;
+}
+
+.tls-cert-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+
+.tls-cert-value {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-primary);
+    word-break: break-all;
+}
+
+.expiry-ok   { color: var(--green); }
+.expiry-warn { color: var(--orange); }
+
+/* SAN tags */
+.tls-san-list { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.tls-san-tag {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px 7px;
+    color: var(--text-secondary);
+}
+
+/* Full pin block */
+.tls-pin-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 4px;
+}
+
+.tls-pin-code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--green);
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    word-break: break-all;
+    cursor: pointer;
+    transition: border-color 0.2s, opacity 0.2s;
+    letter-spacing: 0.5px;
+}
+
+.tls-pin-code:hover {
+    border-color: var(--green);
+    opacity: 0.85;
+}
+
+/* Overwrite warning in generate form */
+.tls-overwrite-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--orange);
+    background: rgba(255, 152, 0, 0.06);
+    border: 1px solid rgba(255, 152, 0, 0.25);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    line-height: 1.5;
+}
+
+.tls-warn-icon { flex-shrink: 0; }
+
+/* Generate result feedback */
+.tls-gen-result {
+    margin: 0 24px 20px;
+    font-size: 13px;
+    padding: 12px 16px;
+    border-radius: var(--radius-sm);
+    line-height: 1.7;
+}
+
+.tls-gen-result.success {
+    background: rgba(0, 230, 118, 0.06);
+    border: 1px solid rgba(0, 230, 118, 0.25);
+    color: var(--text-primary);
+}
+
+.tls-gen-result.error {
+    background: rgba(255, 82, 82, 0.06);
+    border: 1px solid rgba(255, 82, 82, 0.25);
+    color: var(--red);
+}
+
+.tls-gen-result code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--green);
+    word-break: break-all;
+}
+
+/* Restart note */
+.tls-restart-note {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+/* Delete button — outline danger style */
+.btn-delete-cert {
+    width: 100%;
+    padding: 11px 24px;
+    background: transparent;
+    border: 1px solid var(--red);
+    border-radius: var(--radius);
+    color: var(--red);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+}
+
+.btn-delete-cert:hover {
+    background: rgba(255, 82, 82, 0.1);
+}
+
+.btn-delete-cert:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
 }
