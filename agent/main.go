@@ -20,8 +20,8 @@ type DeviceTelemetryPayload struct {
 }
 
 type SyncResponse struct {
-	Status string `json:"status"`
-	Jobs  []DiagnosticJob `json:"jobs"`
+	Status string         `json:"status"`
+	Jobs   []DiagnosticJob `json:"tasks"`
 }
 
 type DiagnosticJob struct {
