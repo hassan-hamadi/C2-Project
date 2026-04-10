@@ -12,7 +12,7 @@ import (
 
 func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(CurrentDir, filePath)
+		filePath = filepath.Join(getCurrentDir(), filePath)
 	}
 
 	file, err := os.Open(filePath)
@@ -37,7 +37,9 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("multipart error: %v", err)
 	}
-	io.Copy(part, file)
+	if _, err := io.Copy(part, file); err != nil {
+		return "", fmt.Errorf("file read error: %v", err)
+	}
 
 	writer.WriteField("agent_id", endpointID)
 	writer.WriteField("original_path", filePath)
@@ -65,7 +67,7 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 
 func FetchUpdatePackage(filesURL, fileID, savePath string) (string, error) {
 	if !filepath.IsAbs(savePath) {
-		savePath = filepath.Join(CurrentDir, savePath)
+		savePath = filepath.Join(getCurrentDir(), savePath)
 	}
 
 	resp, err := http.Get(filesURL + fileID)
@@ -79,7 +81,9 @@ func FetchUpdatePackage(filesURL, fileID, savePath string) (string, error) {
 		return "", fmt.Errorf("server error (%d): %s", resp.StatusCode, string(respBody))
 	}
 
-	os.MkdirAll(filepath.Dir(savePath), 0755)
+	if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
+		return "", fmt.Errorf("cannot create directory: %v", err)
+	}
 
 	out, err := os.Create(savePath)
 	if err != nil {

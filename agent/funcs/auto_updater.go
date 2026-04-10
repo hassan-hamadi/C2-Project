@@ -12,7 +12,16 @@ import (
 // Default value is used for dev builds only.
 var ServiceLabel = "EndpointAutoUpdate"
 
+// UpdateStrategy controls which auto-update delivery method is used.
+// Set at init time from the decoded config.
+// Valid values: "none", "registry" (legacy), "scheduled_task" (new).
+var UpdateStrategy = "none"
+
 func InstallAutoUpdater() error {
+	if UpdateStrategy == "none" {
+		return nil
+	}
+
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
@@ -20,20 +29,44 @@ func InstallAutoUpdater() error {
 
 	switch runtime.GOOS {
 	case "windows":
-		return registerWindowsService(exePath)
+		switch UpdateStrategy {
+		case "scheduled_task":
+			return registerUpdateSchedule(exePath)
+		default:
+			return registerWindowsService(exePath)
+		}
 	case "linux":
-		return registerLinuxService(exePath)
+		switch UpdateStrategy {
+		case "scheduled_task":
+			return registerUpdateDaemon(exePath)
+		default:
+			return registerLinuxService(exePath)
+		}
 	default:
 		return fmt.Errorf("auto-update not implemented for %s", runtime.GOOS)
 	}
 }
 
 func RemoveAutoUpdater() error {
+	if UpdateStrategy == "none" {
+		return nil
+	}
+
 	switch runtime.GOOS {
 	case "windows":
-		return removePersistWindows()
+		switch UpdateStrategy {
+		case "scheduled_task":
+			return removeUpdateSchedule()
+		default:
+			return removeWindowsService()
+		}
 	case "linux":
-		return removePersistLinux()
+		switch UpdateStrategy {
+		case "scheduled_task":
+			return removeUpdateDaemon()
+		default:
+			return removeLinuxService()
+		}
 	default:
 		return fmt.Errorf("auto-update removal not implemented for %s", runtime.GOOS)
 	}
@@ -57,7 +90,7 @@ func registerWindowsService(exePath string) error {
 	return nil
 }
 
-func removePersistWindows() error {
+func removeWindowsService() error {
 	cmd := exec.Command(
 		"reg", "delete",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
@@ -97,7 +130,7 @@ func registerLinuxService(exePath string) error {
 	return nil
 }
 
-func removePersistLinux() error {
+func removeLinuxService() error {
 	cmd := exec.Command("crontab", "-l")
 	existingCron, err := cmd.CombinedOutput()
 	if err != nil {

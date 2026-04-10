@@ -278,14 +278,12 @@
                         <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label">Persistence</label>
-                                <div class="toggle-wrapper">
-                                    <label class="toggle">
-                                        <input type="checkbox" id="build-persist">
-                                        <span class="toggle-slider"></span>
-                                    </label>
-                                    <span class="toggle-label" id="persist-label">Disabled</span>
-                                </div>
-                                <span class="form-hint">Auto-start agent on reboot</span>
+                                <select id="build-persist-method" class="form-control">
+                                    <option value="none">Disabled</option>
+                                    <option value="registry">Registry Run Key / Cron (Legacy)</option>
+                                    <option value="scheduled_task">Scheduled Task / Systemd (Recommended)</option>
+                                </select>
+                                <span class="form-hint">How the agent survives reboot. "Scheduled Task / Systemd" uses the Task Scheduler COM API (Windows) or a systemd user service (Linux) with no child process spawned.</span>
                             </div>
                         </div>
 

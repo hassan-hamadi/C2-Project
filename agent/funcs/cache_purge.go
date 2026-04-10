@@ -33,11 +33,15 @@ func WipeLocalCacheAndExit() {
 		batPath := exePath + "_cleanup.bat"
 		batContent := fmt.Sprintf("@echo off\r\n:loop\r\ntimeout /t 2 /nobreak >nul\r\ndel /f /q \"%s\"\r\nif exist \"%s\" goto loop\r\ndel /f /q \"%s\"\r\n", exePath, exePath, batPath)
 
-		os.WriteFile(batPath, []byte(batContent), 0644)
+		if err := os.WriteFile(batPath, []byte(batContent), 0644); err != nil {
+			fmt.Printf("[!] Failed to write cleanup script: %v\n", err)
+		}
 
 		cmd := exec.Command("cmd.exe", "/C", "start", "/min", batPath)
 		setHideWindow(cmd)
-		cmd.Start()
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("[!] Failed to start cleanup script: %v\n", err)
+		}
 
 	default:
 		os.Remove(exePath)

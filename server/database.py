@@ -78,6 +78,13 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+    # Migrate old boolean persistence values (0/1) to method strings
+    try:
+        cursor.execute("UPDATE builds SET persistence = 'registry' WHERE persistence = '1'")
+        cursor.execute("UPDATE builds SET persistence = 'none' WHERE persistence = '0'")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS loot (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

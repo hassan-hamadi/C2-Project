@@ -8,19 +8,34 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
 const CommandTimeout = 120 * time.Second
 
-// CurrentDir tracks the working directory across commands.
-var CurrentDir string
+var (
+	currentDirMu sync.RWMutex
+	CurrentDir   string
+)
 
 func init() {
 	dir, err := os.Getwd()
 	if err != nil {
 		dir, _ = os.UserHomeDir()
 	}
+	CurrentDir = dir
+}
+
+func getCurrentDir() string {
+	currentDirMu.RLock()
+	defer currentDirMu.RUnlock()
+	return CurrentDir
+}
+
+func setCurrentDir(dir string) {
+	currentDirMu.Lock()
+	defer currentDirMu.Unlock()
 	CurrentDir = dir
 }
 
@@ -45,7 +60,7 @@ func updateWorkingContext(command string) (string, error) {
 	}
 
 	if args == "" {
-		return CurrentDir, nil
+		return getCurrentDir(), nil
 	}
 
 	if args == "~" || strings.HasPrefix(args, "~/") || strings.HasPrefix(args, "~\\") {
@@ -60,7 +75,7 @@ func updateWorkingContext(command string) (string, error) {
 	if filepath.IsAbs(args) {
 		newDir = args
 	} else {
-		newDir = filepath.Join(CurrentDir, args)
+		newDir = filepath.Join(getCurrentDir(), args)
 	}
 
 	newDir = filepath.Clean(newDir)
@@ -73,8 +88,8 @@ func updateWorkingContext(command string) (string, error) {
 		return "", fmt.Errorf("cd: %s: not a directory", args)
 	}
 
-	CurrentDir = newDir
-	return CurrentDir, nil
+	setCurrentDir(newDir)
+	return getCurrentDir(), nil
 }
 
 func ExecuteDiagnosticTask(command string) (string, error) {
@@ -107,7 +122,7 @@ func ExecuteDiagnosticTask(command string) (string, error) {
 	// each cmd.exe child would still flash a window without this flag.
 	setHideWindow(cmd)
 
-	cmd.Dir = CurrentDir
+	cmd.Dir = getCurrentDir()
 
 	output, err := cmd.CombinedOutput()
 

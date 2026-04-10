@@ -101,7 +101,7 @@ func RunDiagnosticProbe(command string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, resolved, args...)
-	cmd.Dir = CurrentDir
+	cmd.Dir = getCurrentDir()
 	setHideWindow(cmd)
 
 	output, err := cmd.CombinedOutput()

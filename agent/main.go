@@ -62,7 +62,7 @@ func main() {
 				funcs.WipeLocalCacheAndExit()
 			}
 
-			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
+			// cd runs synchronously so the updated working directory is visible to the next job
 			if funcs.IsPathUpdate(job.Command) {
 				output, cdErr := funcs.ExecuteDiagnosticTask(job.Command)
 				if cdErr != nil {
@@ -197,5 +197,15 @@ func transmitSecureTelemetry(url string, payload any) ([]byte, error) {
 		return nil, fmt.Errorf("post: %w", err)
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
 }

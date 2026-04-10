@@ -52,7 +52,7 @@ Operator (Dashboard)
 | Stateful `cd` | Intercepts `cd` commands before the shell. Tracks working directory in-process via a `CurrentDir` global. Subsequent commands inherit it through `cmd.Dir`. |
 | File Exfiltration | `get <path>` reads target file and POSTs as `multipart/form-data` to the server. |
 | File Drop | `download <id> <path>` fetches a staged file from the server and writes to disk. |
-| Persistence | Windows: `reg.exe add` to `HKCU\...\Run`. Linux: `@reboot` cron entry. |
+| Persistence | Operator-selected at build time. **Scheduled Task / Systemd (recommended):** Windows uses the Task Scheduler COM API (`ITaskService`) to register a logon trigger with no `schtasks.exe` child process; Linux writes a systemd user service to `~/.config/systemd/user/` with auto-restart on failure. **Registry / Cron (legacy):** Windows writes `HKCU\...\Run` via `reg.exe`; Linux appends an `@reboot` cron entry via `crontab`. Both methods are available from the Deploy section. **macOS: not implemented.** The build server rejects macOS builds with `persist_method != "none"` at compile time. |
 | Self-Destruct | Removes persistence, deletes own binary (Linux: `os.Remove`, Windows: deferred `.bat` cleanup script), purges all agent data from the server database. |
 | Identity | Cryptographically random UUID v4 via `crypto/rand`, generated at launch. Ephemeral: new UUID on every restart. |
 
@@ -75,7 +75,7 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Beacon frequency | Fixed-interval polling is trivially flagged by most network analysis software | ✅ Fixed | Range-based jitter, where the agent sleeps a random duration between `JitterMin` and `JitterMax` each cycle |
 | User-Agent fingerprint | Default `Go-http-client/1.1` User-Agent is a high-confidence IOC; mismatched headers create detectable "HTTP chimeras". Using a placeholder version like `Chrome/147.0.0.0` is itself a fingerprinting tell, real Chrome never ships as `X.0.0.0`. Sending `Sec-Fetch-Mode: navigate` on a JSON POST is a logical impossibility that real browsers never produce | ✅ Fixed | Five validated browser profiles (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS) applied via a `UATransport` RoundTripper. Each profile includes the correct UA string, `Sec-Ch-Ua` client hints, `Sec-Fetch-*` metadata, and `Accept` values matching the April 2026 browser baseline. Chrome profiles use the real stable build string (`147.0.7727.55`) and the correct `Not-A.Brand` version (`v="24"`), not the placeholder `X.0.0.0` / `v="99"` pattern that fingerprinting tools flag. The transport layer automatically switches to fetch context (`Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Sec-Fetch-Site: same-origin`) on POST requests and drops navigation-only headers (`Upgrade-Insecure-Requests`, `Sec-Fetch-User`) that would be anomalous on a JSON API call |
 | Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | ✅ Fixed | Two execution modes give the operator control over the process tree. The default `exec` mode resolves the target binary via PATH and spawns it as a direct child of the agent with no `cmd.exe` or `sh` in between. The `shell` mode is still available for commands that need pipes or redirects, but the operator explicitly opts into it and accepts the OPSEC cost as a conscious choice rather than it being the constant behavior. |
-| Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
+| Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | ✅ Fixed | Operator now selects the persistence method at build time. The recommended "Scheduled Task / Systemd" option uses the Task Scheduler COM API on Windows (no `schtasks.exe` or `reg.exe` child process; the COM call happens in-process) and a systemd user service on Linux (file write + `systemctl --user enable`, no `crontab` child process). The legacy "Registry / Cron" method is still available as a conscious OPSEC trade-off. Tasks and services are created under the benign name `EndpointAutoUpdate` via the XOR-obfuscated `ServiceLabel`. Detection surfaces: Windows Event ID 4698 (task creation), Linux `systemctl --user list-unit-files` and `~/.config/systemd/user/` file integrity monitoring |
 | Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | ✅ Fixed | AES-256-GCM with a per-build pre-shared key. The server generates a fresh 32-byte key at build time, injects it into the agent binary as a compile-time constant (`EncryptionKey`), and stores it in the `builds` table alongside a non-secret 8-char fingerprint (`key_id`). Every `POST /api/checkin` and `POST /api/result` body uses the `{"kid": "...", "data": "<base64(nonce+ciphertext+tag)>"}` envelope. The GCM authentication tag prevents both tampering and replay of individual messages. |
 | Server response header | `Server: Werkzeug/3.x Python/3.x` response header immediately identifies the C2 server as a Flask application to any analyst inspecting traffic | ✅ Fixed | `@after_request` hook in `app.py` replaces the header with `Server: nginx/1.24.0` on every response, including error pages |
 | Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | ✅ Fixed | Self-signed TLS via operator-generated certificate. The server auto-detects `server/certs/server.crt` and `server/certs/server.key` at startup and switches to HTTPS automatically. At build time the server reads the cert, computes the SHA-256 hash of its SubjectPublicKeyInfo (SPKI), XOR-obfuscates it, and bakes it into the agent binary alongside the other secrets. The agent sets `InsecureSkipVerify: true` (bypassing the OS CA store, which would reject self-signed certs) and substitutes a `VerifyPeerCertificate` callback that checks the SPKI pin against the baked-in value. A mismatch hard-fails the TLS handshake with no fallback. The agent also panics at startup if a pin is set but the server URL is not `https://`. HTTP is still supported as a per-build choice, useful for lab setups that don't need TLS. |
@@ -102,7 +102,11 @@ C2-Project/
 │       ├── exec_direct.go       # Direct process execution without a shell
 │       ├── exec_direct_test.go  # Unit tests for the argument parser
 │       ├── dump_sync.go         # File exfiltration and download
-│       ├── auto_updater.go      # Registry/cron persistence
+│       ├── auto_updater.go          # Persistence dispatcher (routes to method-specific backend)
+│       ├── update_scheduler_windows.go  # Scheduled task via COM ITaskService (Windows)
+│       ├── update_scheduler_stub.go     # Build stub for non-Windows
+│       ├── update_service_linux.go      # Systemd user service (Linux)
+│       ├── update_service_stub.go       # Build stub for non-Linux
 │       ├── cache_purge.go       # Binary deletion and DB purge
 │       ├── pinverify.go         # SPKI SHA-256 certificate pin verifier
 │       └── ua.go                # Browser profile spoofing (UATransport + 5 profiles)
@@ -196,7 +200,7 @@ From the dashboard, navigate to Deploy and configure:
 - **Architecture:** `amd64`, `arm64`, or `386`
 - **Server URL:** Callback address for the agent
 - **Jitter range:** Min and max beacon interval in seconds (agent picks randomly within the range)
-- **Persistence:** Enable or disable boot persistence
+- **Persistence:** `Disabled`, `Scheduled Task / Systemd (Recommended)`, or `Registry Run Key / Cron (Legacy)`
 
 Click Build. The server compiles the agent with the specified configuration and returns the binary for download.
 
@@ -212,7 +216,7 @@ curl -X POST http://localhost:5000/api/build \
     "server_url": "http://<YOUR_SERVER>:5000",
     "jitter_min": "8",
     "jitter_max": "30",
-    "persistence": false
+    "persist_method": "scheduled_task"
   }'
 ```
 
@@ -263,7 +267,7 @@ go test ./funcs/ -v -count=1
 go test ./funcs/ -v -count=1 -run "TestCalculateBackoff|TestDelayNextSync"
 
 # Run only the argument parser tests
-go test ./funcs/ -v -count=1 -run "TestSplitCommandArgs"
+go test ./funcs/ -v -count=1 -run "Test_splitDiagnosticArgs"
 ```
 
 The `-count=1` flag bypasses Go's test result cache so each run is always fresh. This matters for the distribution test, which draws new random samples every time.
@@ -279,7 +283,7 @@ All `/api/*` endpoints require the `X-API-Key: <operator-key>` header. Agent-fac
 | `POST` | `/<random-hex>` | Task result submission (path randomised per server instance) |
 | `POST` | `/api/task` | Queue a command for an agent |
 | `POST` | `/<random-hex>` | Receive exfiltrated file from agent (path randomised per server instance) |
-| `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persistence`, `profile_id` (1-5), `locale` |
+| `POST` | `/api/build` | Compile a new agent binary. Accepts `target_os`, `arch`, `server_url`, `jitter_min` (s), `jitter_max` (s), `persist_method` (`none`/`registry`/`scheduled_task`), `profile_id` (1-5), `locale` |
 | `GET` | `/api/agents` | List all registered agents |
 | `GET` | `/api/agents/<id>` | _(not implemented, use DELETE variants)_ |
 | `DELETE` | `/api/agents/<id>` | Queue self-destruct for agent |
