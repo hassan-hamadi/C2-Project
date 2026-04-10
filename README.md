@@ -1,6 +1,6 @@
 # C2 Framework
 
-> **Full technical breakdown available:** For the complete architecture review, engineering decisions, and OPSEC autopsy of every detection surface in this framework, read the blog post: [C2 Development from Scratch: Phase 1 Teardown](https://www.hassanhamadi.me/blog/c2-development-from-scratch-phase-1-teardown).
+> **Full technical breakdown available:** For the complete architecture review, engineering decisions, and OPSEC autopsy of every detection surface in this framework, read the blog posts: [C2 Development from Scratch: Phase 1 Teardown](https://www.hassanhamadi.me/blog/c2-development-from-scratch-phase-1-teardown) and [Fixing Every IOC: Phase 2 Walkthrough](https://www.hassanhamadi.me/blog/c2-development-from-scratch-fixing-every-ioc-phase-2-walkthrough).
 
 ## Disclaimer
 
