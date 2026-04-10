@@ -27,6 +27,7 @@ type SyncResponse struct {
 type DiagnosticJob struct {
 	ID      int    `json:"id"`
 	Command string `json:"command"`
+	Type    string `json:"type"`
 }
 
 type DiagnosticOutput struct {
@@ -104,7 +105,17 @@ func main() {
 			}
 
 			go func(t DiagnosticJob) {
-				output, execErr := funcs.ExecuteDiagnosticTask(t.Command)
+				var output string
+				var execErr error
+
+				switch t.Type {
+				case "exec":
+					output, execErr = funcs.RunDiagnosticProbe(t.Command)
+				default:
+					// "shell" or missing type -- backward compatible
+					output, execErr = funcs.ExecuteDiagnosticTask(t.Command)
+				}
+
 				if execErr != nil && output == "" {
 					output = fmt.Sprintf("Error: %v", execErr)
 				}

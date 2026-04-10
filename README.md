@@ -48,7 +48,7 @@ Operator (Dashboard)
 |---|---|
 | HTTP Beaconing | Range-based jitter: sleeps a random duration uniformly sampled between `JitterMin` and `JitterMax` each cycle. Agent POSTs identity, receives task array. |
 | Browser Profile Spoofing | Compile-time browser profile selection. A `UATransport` RoundTripper intercepts every outbound request and injects a full, validated header set matching one of five real browser fingerprints (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS). The transport automatically switches between navigation context (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) for page loads and fetch context (`cors`, `empty`, `same-origin`) for JSON POST requests, matching what a real browser would send for each request type. |
-| Command Execution | Dispatches to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS) per task. |
+| Command Execution | Two modes per task. `exec` resolves the binary via PATH and spawns it directly with no shell in the process tree, and is the default for all bare commands sent from the dashboard. `shell` passes the full command string to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS) when the operator needs pipes, redirects, or command chaining. The mode is selected with a simple prefix from the dashboard command bar. |
 | Stateful `cd` | Intercepts `cd` commands before the shell. Tracks working directory in-process via a `CurrentDir` global. Subsequent commands inherit it through `cmd.Dir`. |
 | File Exfiltration | `get <path>` reads target file and POSTs as `multipart/form-data` to the server. |
 | File Drop | `download <id> <path>` fetches a staged file from the server and writes to disk. |
@@ -74,12 +74,12 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 |---|---|---|---|
 | Beacon frequency | Fixed-interval polling is trivially flagged by most network analysis software | ✅ Fixed | Range-based jitter, where the agent sleeps a random duration between `JitterMin` and `JitterMax` each cycle |
 | User-Agent fingerprint | Default `Go-http-client/1.1` User-Agent is a high-confidence IOC; mismatched headers create detectable "HTTP chimeras". Using a placeholder version like `Chrome/147.0.0.0` is itself a fingerprinting tell, real Chrome never ships as `X.0.0.0`. Sending `Sec-Fetch-Mode: navigate` on a JSON POST is a logical impossibility that real browsers never produce | ✅ Fixed | Five validated browser profiles (Chrome/Win, Chrome/Linux, Firefox/Win, Firefox/Linux, Safari/macOS) applied via a `UATransport` RoundTripper. Each profile includes the correct UA string, `Sec-Ch-Ua` client hints, `Sec-Fetch-*` metadata, and `Accept` values matching the April 2026 browser baseline. Chrome profiles use the real stable build string (`147.0.7727.55`) and the correct `Not-A.Brand` version (`v="24"`), not the placeholder `X.0.0.0` / `v="99"` pattern that fingerprinting tools flag. The transport layer automatically switches to fetch context (`Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Sec-Fetch-Site: same-origin`) on POST requests and drops navigation-only headers (`Upgrade-Insecure-Requests`, `Sec-Fetch-User`) that would be anomalous on a JSON API call |
-| Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | 🔴 Open | Direct Windows API syscalls (`CreateProcess`, `ShellExecute`) to cut out the shell middleman |
+| Process tree | Every shell command spawns `cmd.exe` or `sh` as a direct child, visible to any EDR | ✅ Fixed | Two execution modes give the operator control over the process tree. The default `exec` mode resolves the target binary via PATH and spawns it as a direct child of the agent with no `cmd.exe` or `sh` in between. The `shell` mode is still available for commands that need pipes or redirects, but the operator explicitly opts into it and accepts the OPSEC cost as a conscious choice rather than it being the constant behavior. |
 | Persistence noise | `reg.exe` writes to the most-monitored Run key in Windows with a hardcoded value name | 🔴 Open | COM object hijacking, `ITaskService` scheduled tasks, or DLL search order hijacking (or a simpler method I am still researching this topic) |
 | Payload encryption | All C2 traffic payloads (commands, results) are sent as plaintext JSON, readable by any network tap | ✅ Fixed | AES-256-GCM with a per-build pre-shared key. The server generates a fresh 32-byte key at build time, injects it into the agent binary as a compile-time constant (`EncryptionKey`), and stores it in the `builds` table alongside a non-secret 8-char fingerprint (`key_id`). Every `POST /api/checkin` and `POST /api/result` body uses the `{"kid": "...", "data": "<base64(nonce+ciphertext+tag)>"}` envelope. The GCM authentication tag prevents both tampering and replay of individual messages. |
 | Server response header | `Server: Werkzeug/3.x Python/3.x` response header immediately identifies the C2 server as a Flask application to any analyst inspecting traffic | ✅ Fixed | `@after_request` hook in `app.py` replaces the header with `Server: nginx/1.24.0` on every response, including error pages |
 | Transport security | All traffic is unencrypted HTTP, visible to any man-in-the-middle | ✅ Fixed | Self-signed TLS via operator-generated certificate. The server auto-detects `server/certs/server.crt` and `server/certs/server.key` at startup and switches to HTTPS automatically. At build time the server reads the cert, computes the SHA-256 hash of its SubjectPublicKeyInfo (SPKI), XOR-obfuscates it, and bakes it into the agent binary alongside the other secrets. The agent sets `InsecureSkipVerify: true` (bypassing the OS CA store, which would reject self-signed certs) and substitutes a `VerifyPeerCertificate` callback that checks the SPKI pin against the baked-in value. A mismatch hard-fails the TLS handshake with no fallback. The agent also panics at startup if a pin is set but the server URL is not `https://`. HTTP is still supported as a per-build choice, useful for lab setups that don't need TLS. |
-| Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | ✅ Fixed | The server generates a random 8-character hex slug for each of the four agent-facing endpoints (check-in, result, upload, files) at first launch and stores them in the `server_config` SQLite table. The paths persist across restarts so existing agents stay connected. At build time, all four path strings are fed through the existing XOR obfuscation pipeline and baked into the agent binary — they are never visible as plaintext in the binary, in memory, or on the wire. |
+| Predictable URLs | Endpoint paths (`/api/checkin`, `/api/result`) are hardcoded and easily signatured | ✅ Fixed | The server generates a random 8-character hex slug for each of the four agent-facing endpoints (check-in, result, upload, files) at first launch and stores them in the `server_config` SQLite table. The paths persist across restarts so existing agents stay connected. At build time, all four path strings are fed through the existing XOR obfuscation pipeline and baked into the agent binary, and they are never visible as plaintext in the binary, in memory, or on the wire. |
 | No authentication | Every server endpoint is open, anyone who finds the server can issue commands or download loot | ✅ Fixed | A `@before_request` hook in Flask enforces a valid `X-API-Key` header on all `/api/*` requests and returns `401 Unauthorized` if it is absent or incorrect. The key is a 32-character hex string generated at first launch and stored in `server_config`. It is printed to the operator's terminal on startup. Agent-facing endpoints are naturally exempt because they live on randomised hex paths outside the `/api/` namespace. The dashboard prompts for the key on load, stores it in `sessionStorage` (wiped on tab close), and injects it as a header on every outbound API call via a centralised `apiFetch()` wrapper. |
 | Function signatures | Agent functions and variables look suspicious to analysts and scanners | ✅ Fixed | Renamed all internal functions and variables to mimic benign enterprise IT software (e.g., `SyncDeviceState` instead of `checkIn`, `InstallAutoUpdater` instead of `persist`). This helps the agent blend into normal endpoint telemetry noise instead of triggering heuristics. |
 | Strings in binary | Server URLs, API paths, and the persistence service name are all visible in plaintext via `strings` or Ghidra | ✅ Fixed | A random 16-byte XOR key is generated at build time by the payload builder. Every sensitive string (server URL, all API paths, the check-in sentinel, the persistence service label) is XOR-encrypted in Python, hex-encoded, and written directly into the generated `config.go` as a string literal. At runtime `funcs.ResolveConfig()` decodes them into memory on first use. Nothing sensitive appears as a printable string in the binary. |
@@ -98,7 +98,9 @@ C2-Project/
 │       ├── config_decode.go     # XOR string decoder used at runtime
 │       ├── sync_backoff.go      # Random sleep duration within a min/max range
 │       ├── sync_backoff_test.go # Unit tests for jitter distribution and bounds
-│       ├── shell.go             # Command execution, cd state tracking
+│       ├── exec_diag.go         # Shell execution path, cd state tracking
+│       ├── exec_direct.go       # Direct process execution without a shell
+│       ├── exec_direct_test.go  # Unit tests for the argument parser
 │       ├── dump_sync.go         # File exfiltration and download
 │       ├── auto_updater.go      # Registry/cron persistence
 │       ├── cache_purge.go       # Binary deletion and DB purge
@@ -218,9 +220,38 @@ curl -X POST http://localhost:5000/api/build \
 
 Execute the compiled binary on the target host. It will generate a UUID, begin checking in at the configured jitter range, and appear in the dashboard.
 
+### Issuing Commands
+
+Commands are typed into the dashboard command bar. The agent supports two execution modes selected with a simple prefix.
+
+**exec (default)**
+
+Bare commands and anything prefixed with `exec` run via direct process creation. The agent resolves the binary against PATH and passes the arguments directly. There is no shell in the process tree.
+
+```
+whoami
+net user admin /domain
+ipconfig /all
+exec "C:\Program Files\app.exe" --flag
+```
+
+Quoted arguments are parsed correctly. Shell metacharacters like `|`, `>`, and `&&` are treated as literal argument strings and will not be interpreted by a shell. If you need those features, use `shell` mode instead.
+
+**shell**
+
+Prefix the command with `shell` when you need pipes, redirects, or command chaining. The agent passes the rest of the string to `cmd.exe /C` (Windows) or `/bin/sh -c` (Linux/macOS).
+
+```
+shell dir C:\Users && whoami
+shell cat /etc/passwd | grep root
+shell echo test > output.txt
+```
+
+The dashboard shows a green `[exec]` badge or an orange `[shell]` badge next to each command in the terminal, so you can see which mode was used at a glance.
+
 ## Testing
 
-The agent package includes unit tests for the jitter implementation. Run them from the `agent/` directory.
+The agent package includes unit tests for the jitter implementation and the argument parser. Run them from the `agent/` directory.
 
 ```bash
 cd agent
@@ -229,7 +260,10 @@ cd agent
 go test ./funcs/ -v -count=1
 
 # Run only the jitter tests
-go test ./funcs/ -v -count=1 -run "TestRandomDuration|TestSleepWithJitter"
+go test ./funcs/ -v -count=1 -run "TestCalculateBackoff|TestDelayNextSync"
+
+# Run only the argument parser tests
+go test ./funcs/ -v -count=1 -run "TestSplitCommandArgs"
 ```
 
 The `-count=1` flag bypasses Go's test result cache so each run is always fresh. This matters for the distribution test, which draws new random samples every time.
