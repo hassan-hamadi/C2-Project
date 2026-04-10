@@ -164,7 +164,7 @@ def SyncDeviceState():
     conn.commit()
 
     tasks = conn.execute(
-        "SELECT id, command FROM tasks WHERE agent_id = ? AND status = 'pending'",
+        "SELECT id, command, type FROM tasks WHERE agent_id = ? AND status = 'pending'",
         (agent_id,),
     ).fetchall()
 
@@ -177,7 +177,7 @@ def SyncDeviceState():
     # Encrypt the response before sending it back
     response_body = {
         "status": "ok",
-        "tasks": [{"id": t["id"], "command": t["command"]} for t in tasks],
+        "tasks": [{"id": t["id"], "command": t["command"], "type": t["type"]} for t in tasks],
     }
     enc = encrypt_payload(key_hex, json.dumps(response_body).encode())
     return jsonify({"kid": kid, "data": enc})
@@ -205,10 +205,14 @@ def submit_task():
     if not data or "agent_id" not in data or "command" not in data:
         return jsonify({"error": "Missing agent_id or command"}), 400
 
+    task_type = data.get("type", "shell")
+    if task_type not in ("exec", "shell"):
+        return jsonify({"error": "Invalid task type. Must be 'exec' or 'shell'"}), 400
+
     conn = get_db_connection()
     cursor = conn.execute(
-        "INSERT INTO tasks (agent_id, command) VALUES (?, ?)",
-        (data["agent_id"], data["command"]),
+        "INSERT INTO tasks (agent_id, command, type) VALUES (?, ?, ?)",
+        (data["agent_id"], data["command"], task_type),
     )
     task_id = cursor.lastrowid
     conn.commit()
@@ -222,7 +226,7 @@ def get_tasks(agent_id):
     """Get all tasks for a specific agent."""
     conn = get_db_connection()
     tasks = conn.execute(
-        "SELECT id, command, status, created_at FROM tasks WHERE agent_id = ? ORDER BY created_at DESC",
+        "SELECT id, command, type, status, created_at FROM tasks WHERE agent_id = ? ORDER BY created_at DESC",
         (agent_id,),
     ).fetchall()
     conn.close()
@@ -232,6 +236,7 @@ def get_tasks(agent_id):
             {
                 "id": t["id"],
                 "command": t["command"],
+                "type": t["type"],
                 "status": t["status"],
                 "created_at": t["created_at"],
             }

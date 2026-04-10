@@ -65,6 +65,12 @@ def init_db():
         )
     """)
 
+    # Add type column to tasks table (safe to re-run, ignores if it exists)
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN type TEXT DEFAULT 'shell'")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     # Add columns for encryption key storage (safe to re-run, ignores if they exist)
     for _col, _coltype in [("key_id", "TEXT"), ("encryption_key", "TEXT"), ("cert_pin", "TEXT")]:
         try:

@@ -149,7 +149,7 @@
                     <!-- Command Input -->
                     <div class="command-bar" id="command-bar">
                         <span class="prompt-symbol">❯</span>
-                        <input type="text" id="command-input" class="command-input" placeholder="Enter command…"
+                        <input type="text" id="command-input" class="command-input" placeholder="Enter command… (prefix with &quot;shell&quot; for shell execution)"
                             autocomplete="off" disabled>
                         <button class="btn-send" id="send-btn" disabled onclick="sendCommand()">
                             EXEC ⏎
@@ -160,6 +160,13 @@
                             📁 Send File
                         </button>
                         <input type="file" id="send-file-input" style="display:none" onchange="sendFileToAgent(this)">
+                    </div>
+
+                    <!-- Command Help -->
+                    <div class="command-help" id="command-help">
+                        <span class="help-text">
+                            Commands run via direct exec by default. Prefix with <code>shell</code> for shell features (pipes, redirects).
+                        </span>
                     </div>
 
                     <!-- Task History (Collapsible) -->

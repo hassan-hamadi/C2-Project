@@ -168,13 +168,26 @@ function selectAgent(agentId) {
 function sendCommand() {
     if (!selectedAgentId) return;
 
-    const command = commandInput.value.trim();
+    let command = commandInput.value.trim();
     if (!command) return;
 
-    // Append to terminal
+    // Determine execution type from prefix
+    let taskType = "exec"; // default to exec (OPSEC-safe)
+    if (command.startsWith("shell ")) {
+        taskType = "shell";
+        command = command.substring(6).trim();
+    } else if (command.startsWith("exec ")) {
+        taskType = "exec";
+        command = command.substring(5).trim();
+    }
+
+    if (!command) return;
+
+    // Append to terminal with mode indicator
     appendToTerminal(`
         <div class="cmd-line">
             <span class="cmd-prompt">❯ </span>
+            <span class="cmd-type cmd-type-${taskType}">[${taskType}]</span>
             <span class="cmd-text">${escapeHtml(command)}</span>
         </div>
         <div class="cmd-status pending">⏳ Pending - waiting for agent check-in…</div>
@@ -189,6 +202,7 @@ function sendCommand() {
         body: JSON.stringify({
             agent_id: selectedAgentId,
             command: command,
+            type: taskType,
         }),
     })
         .then((res) => res.json())
