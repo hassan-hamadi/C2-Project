@@ -66,7 +66,7 @@ Operator (Dashboard)
 | File Staging | Operator uploads files via dashboard. Agent pulls by numeric ID on command. |
 | Agent Management | Registration on first check-in, `last_seen` update on subsequent check-ins, cascading purge on self-destruct. |
 
-### Evasion Status
+### Evasion Status (Phase 2)
 
 Tracks every known detection surface, what the fix is, and whether it has been implemented yet.
 
@@ -84,6 +84,23 @@ Tracks every known detection surface, what the fix is, and whether it has been i
 | Function signatures | Agent functions and variables look suspicious to analysts and scanners | ✅ Fixed | Renamed all internal functions and variables to mimic benign enterprise IT software (e.g., `SyncDeviceState` instead of `checkIn`, `InstallAutoUpdater` instead of `persist`). This helps the agent blend into normal endpoint telemetry noise instead of triggering heuristics. |
 | Strings in binary | Server URLs, API paths, and the persistence service name are all visible in plaintext via `strings` or Ghidra | ✅ Fixed | A random 16-byte XOR key is generated at build time by the payload builder. Every sensitive string (server URL, all API paths, the check-in sentinel, the persistence service label) is XOR-encrypted in Python, hex-encoded, and written directly into the generated `config.go` as a string literal. At runtime `funcs.ResolveConfig()` decodes them into memory on first use. Nothing sensitive appears as a printable string in the binary. |
 | Build metadata / compiler footprint | Go embeds source file paths and the module name in binaries. Without extra flags, running `strings` or loading the binary in Ghidra exposes build paths like `C:\Users\<user>\Desktop\repos\C2-Project\agent\funcs\selfdestruct.go` and the original module name | ✅ Fixed | `-trimpath` strips absolute host build paths from debug info at compile time. `-buildid=` clears the per-build hash. Source files in `funcs/` were renamed to match the telemetry cover (`seal.go`, `sync_backoff.go`, `auto_updater.go`, `cache_purge.go`, `dump_sync.go`) so any residual relative paths look benign. The Go module was renamed from `c2-agent` to `endpoint-telemetry`, which is embedded in every Go binary regardless of strip flags. |
+
+### Remaining Detection Surfaces (Phase 3)
+
+Known gaps that survive the current evasion work. Each one requires a focused fix.
+
+| Surface | Risk | Status | Planned Fix |
+|---|---|---|---|
+| TLS/JA3 fingerprint | Go's TLS stack produces a distinctive JA3 hash regardless of HTTP-layer spoofing. A defender correlating JA3 against the claimed User-Agent sees Chrome headers over a Go TLS handshake, a contradiction no real browser produces | ❌ Planned | Integrate `uTLS` to mimic a specific browser's TLS client hello parameters. If spoofing Chrome at the HTTP layer, the TLS handshake should match Chrome too |
+| Windows task creation event | The COM-based scheduled task avoids `schtasks.exe` in the process tree, but Windows Event ID 4698 is still written to the Security log on task creation. Any SIEM forwarding Windows Security events will see it | ❌ Planned | Investigate alternative persistence paths that do not generate 4698, or explore suppressing event log writes via direct registry manipulation instead of the task scheduler API |
+| Self-destruct cleanup artifact | On Windows, the self-destruct writes a `.bat` file to disk (`del /f /q` loop) to delete the agent binary after it exits. The batch file is a forensic artifact recoverable from disk | ❌ Planned | Replace with `MoveFileEx` + `MOVEFILE_DELAY_UNTIL_REBOOT` to queue deletion at the OS level with no intermediate file, or spawn a short-lived `PowerShell Start-Process` with a `-WindowStyle Hidden` delay |
+| Bounded jitter | Traffic never exceeds `JitterMax` and never drops below `JitterMin`. That bounding box is a weak signature: given enough observation time, statistical analysis can extract the range and flag it as non-human patterned traffic | ❌ Planned | Traffic shaping to vary payload sizes and timing to mimic known benign traffic profiles (Windows Update telemetry, Slack webhook cadence, cloud API polling) rather than uniform random within a static range |
+| Process parentage | In `exec` mode, `cmd.exe` is gone from the process tree, but an unsigned binary directly spawning system utilities (`whoami.exe`, `ipconfig.exe`) is still visible to EDRs that monitor parent-child relationships for unsigned or unknown parents | ❌ Planned | In-memory payload execution and reflective loading to avoid touching disk and to remove the agent binary from the process tree entirely |
+| systemd service visibility | The Linux user service sits in `~/.config/systemd/user/` as a plaintext unit file. `systemctl --user list-unit-files` lists it. File integrity monitoring catches it on write | ❌ Planned | No clean alternative at the user level without root. Document the trade-off clearly. Investigate whether writing the unit file only at runtime (rather than at install time) reduces the FIM exposure window |
+| macOS persistence | Not implemented. The build server rejects macOS builds with `persist_method != "none"` at compile time | ❌ Planned | LaunchAgent plist in `~/Library/LaunchAgents/`. Requires a macOS test environment |
+| AES-GCM nonce replay | The server does not track seen nonces. A captured check-in ciphertext blob can be replayed and will decrypt to a valid (stale) payload. The server processes it as a duplicate check-in | ❌ Planned | Server-side nonce deduplication per agent: store the last N nonces in `server_config` or a dedicated table and reject duplicates with a 409 response |
+| No interactive sessions | The current model is request-response: one command in, one output out. No persistent shell session, no interactive tooling (debuggers, REPLs, anything that expects a TTY) | ❌ Planned | Persistent shell sessions with bidirectional piped I/O. Requires a keep-alive connection model rather than the current polling loop |
+| Direct C2 reachability | Every agent must reach the C2 server directly. Hosts on isolated network segments with no outbound internet access cannot check in | ❌ Planned | Agent chaining: route traffic through a compromised host that does have outbound access, using it as a relay for agents that cannot reach the server directly |
 
 ## Project Structure
 
