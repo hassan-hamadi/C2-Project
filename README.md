@@ -4,7 +4,7 @@
 
 ## Disclaimer
 
-This is an educational and authorized security research tool. It is a Phase 1 Alpha build with intentionally documented detection surfaces. Do not deploy this outside of lab environments you own or have explicit written authorization to test. The accompanying blog post details every IOC this framework generates and exactly how a Blue Team would catch it.
+This is an educational and authorized security research tool. Do not deploy this outside of lab environments you own or have explicit written authorization to test. The accompanying blog posts detail the architecture, every IOC this framework generates, and the evasion work done to address them.
 
 ## Overview
 
@@ -12,7 +12,7 @@ A command and control framework built from scratch to understand C2 communicatio
 
 The agent is a statically linked Go binary with zero external dependencies. It checks in on a configurable interval, retrieves pending tasks, executes them, and reports results. The server compiles agents on demand with operator-specified configuration (callback URL, check-in interval, persistence) injected directly into the Go source as compile-time literals. There is no config file on disk.
 
-This is an Alpha build. It is not OPSEC-safe and was never intended to be. It generates significant behavioral artifacts that are trivially detectable by EDR, network monitoring, and basic forensic triage. Every one of those artifacts is documented in the blog post above.
+Phase 1 is complete. The framework includes evasion work across network traffic, process execution, persistence, binary analysis, and server hardening. Known remaining detection surfaces are documented in the Remaining Detection Surfaces table below and are the focus of Phase 3.
 
 ## Architecture
 
