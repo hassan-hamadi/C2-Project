@@ -114,6 +114,32 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS seen_nonces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kid TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(kid, nonce)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_seen_nonces_received_at
+        ON seen_nonces (received_at)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def purge_old_nonces(days: int = 7):
+    """Delete nonce records older than `days` days."""
+    conn = get_db_connection()
+    conn.execute(
+        "DELETE FROM seen_nonces WHERE received_at < datetime('now', ?)",
+        (f"-{days} days",),
+    )
     conn.commit()
     conn.close()
 

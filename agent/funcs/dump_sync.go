@@ -2,6 +2,9 @@ package funcs
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -10,7 +13,7 @@ import (
 	"path/filepath"
 )
 
-func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
+func SubmitCrashDump(uploadURL, endpointID, filePath string, keyID string, encKey []byte) (string, error) {
 	if !filepath.IsAbs(filePath) {
 		filePath = filepath.Join(getCurrentDir(), filePath)
 	}
@@ -25,9 +28,30 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot stat file: %v", err)
 	}
-
 	if fi.IsDir() {
 		return "", fmt.Errorf("cannot upload a directory")
+	}
+
+	fileData, err := io.ReadAll(file)
+	if err != nil {
+		return "", fmt.Errorf("file read error: %v", err)
+	}
+
+	sum := sha256.Sum256(fileData)
+	meta, err := json.Marshal(map[string]string{
+		"agent_id": endpointID,
+		"sha256":   hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %v", err)
+	}
+	enc, err := SealTelemetry(encKey, meta)
+	if err != nil {
+		return "", fmt.Errorf("seal error: %v", err)
+	}
+	authJSON, err := json.Marshal(map[string]string{"kid": keyID, "data": enc})
+	if err != nil {
+		return "", fmt.Errorf("auth marshal error: %v", err)
 	}
 
 	var body bytes.Buffer
@@ -37,12 +61,13 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("multipart error: %v", err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
-		return "", fmt.Errorf("file read error: %v", err)
+	if _, err := part.Write(fileData); err != nil {
+		return "", fmt.Errorf("multipart write error: %v", err)
 	}
 
 	writer.WriteField("agent_id", endpointID)
 	writer.WriteField("original_path", filePath)
+	writer.WriteField("auth", string(authJSON))
 	writer.Close()
 
 	req, err := http.NewRequest("POST", uploadURL, &body)

