@@ -12,6 +12,11 @@ let taskHistoryVersion = 0;
 let submissionVersion = 0;
 let terminalViewVersion = 0;
 let fileUploadInProgress = false;
+const agentOnlineStates = new Map();
+const seenAgentIds = new Set();
+const scheduleFrame = typeof globalThis.requestAnimationFrame === "function"
+    ? globalThis.requestAnimationFrame.bind(globalThis)
+    : (callback) => callback();
 
 function apiFetch(url, options = {}) {
     return fetch(url, options).then(res => {
@@ -33,18 +38,131 @@ const selectedAgentBadge = document.getElementById("selected-agent-badge");
 const taskListEl = document.getElementById("task-list");
 const refreshBtn = document.getElementById("refresh-agents");
 
+// Motion and interaction helpers.
+
+function positionNavIndicator(navItem = null) {
+    if (typeof document?.querySelector !== "function") return;
+    const nav = document.querySelector(".sidebar-nav");
+    const indicator = document.getElementById?.("nav-selection-indicator");
+    if (!navItem) navItem = document.querySelector(".nav-item.active");
+    if (!nav || !indicator || !navItem ||
+        typeof nav.getBoundingClientRect !== "function" ||
+        typeof navItem.getBoundingClientRect !== "function" ||
+        !indicator.style) return;
+
+    const navRect = nav.getBoundingClientRect();
+    const itemRect = navItem.getBoundingClientRect();
+    indicator.style.setProperty("--nav-indicator-x", `${itemRect.left - navRect.left}px`);
+    indicator.style.setProperty("--nav-indicator-y", `${itemRect.top - navRect.top}px`);
+    indicator.style.setProperty("--nav-indicator-width", `${itemRect.width}px`);
+    indicator.style.setProperty("--nav-indicator-height", `${itemRect.height}px`);
+    scheduleFrame(() => indicator.classList?.add("ready"));
+}
+
+function updateStatValue(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const next = String(value);
+    const changed = el.textContent !== "--" && el.textContent !== next;
+    el.textContent = value;
+    if (changed) {
+        el.classList.remove("stat-value-updated");
+        void el.offsetWidth;
+        el.classList.add("stat-value-updated");
+        setTimeout(() => el.classList.remove("stat-value-updated"), 260);
+    }
+}
+
+function setActionButtonState(button, state, label) {
+    if (!button) return;
+    if (state === "loading" && button.__actionStateTimer) {
+        clearTimeout(button.__actionStateTimer);
+        button.__actionStateTimer = null;
+    }
+
+    const hasDomState = !!button.dataset && !!button.classList && typeof button.getBoundingClientRect === "function";
+    if (!hasDomState) {
+        if (button.__idleText == null) button.__idleText = button.textContent || button.innerHTML || "";
+        button.disabled = state === "loading";
+        button.textContent = state === "idle" ? button.__idleText : label;
+        return;
+    }
+
+    if (!button.dataset.idleHtml) button.dataset.idleHtml = button.innerHTML;
+    if (!button.dataset.idleMinWidth) button.dataset.idleMinWidth = `${Math.ceil(button.getBoundingClientRect().width)}px`;
+
+    button.classList.remove("is-loading", "is-success", "is-error");
+    button.style.minWidth = button.dataset.idleMinWidth;
+
+    if (state === "idle") {
+        button.innerHTML = button.dataset.idleHtml;
+        button.disabled = false;
+        return;
+    }
+
+    button.classList.add(`is-${state}`);
+    button.disabled = state === "loading";
+    button.innerHTML = `<span class="action-state"><span class="action-state-indicator" aria-hidden="true"></span><span>${escapeHtml(label)}</span></span>`;
+}
+
+function settleActionButton(button, state, label, delay = 900) {
+    setActionButtonState(button, state, label);
+    const hasDomState = !!button?.dataset && !!button?.classList && typeof button?.getBoundingClientRect === "function";
+    if (!hasDomState) {
+        setActionButtonState(button, "idle", "");
+        return;
+    }
+    if (button.__actionStateTimer) clearTimeout(button.__actionStateTimer);
+    button.__actionStateTimer = setTimeout(() => {
+        button.__actionStateTimer = null;
+        setActionButtonState(button, "idle", "");
+    }, delay);
+}
+
+function showToast(message, type = "info", duration = 3200) {
+    const stack = document.getElementById?.("toast-stack");
+    if (!stack || !message || typeof document.createElement !== "function" || typeof stack.appendChild !== "function") return;
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.setAttribute?.("role", type === "error" ? "alert" : "status");
+    const text = document.createElement("div");
+    text.className = "toast-message";
+    text.textContent = message;
+    toast.appendChild?.(text);
+    stack.appendChild(toast);
+
+    const remove = () => {
+        toast.classList?.add("toast-leave");
+        setTimeout(() => toast.remove?.(), 180);
+    };
+    const timer = setTimeout(remove, duration);
+    toast.addEventListener?.("click", () => {
+        clearTimeout(timer);
+        remove();
+    }, { once: true });
+}
+
+if (typeof window?.addEventListener === "function") window.addEventListener("resize", () => positionNavIndicator());
+
 // Section switching.
 
 function switchSection(sectionName) {
-    document.querySelectorAll(".section").forEach((s) => s.classList.remove("active"));
-
-    document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
-
+    const current = document.querySelector(".section.active");
     const section = document.getElementById(`section-${sectionName}`);
     const navItem = document.getElementById(`nav-${sectionName}`);
 
-    if (section) section.classList.add("active");
-    if (navItem) navItem.classList.add("active");
+    if (!section || !navItem) return;
+
+    if (current !== section) {
+        document.querySelectorAll(".section").forEach((s) => s.classList.remove("active"));
+        section.classList.add("active");
+    }
+
+    document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
+    navItem.classList.add("active");
+    document.body.classList.toggle("control-mode", sectionName === "control");
+    closeAllCustomSelects();
+    scheduleFrame(() => positionNavIndicator(navItem));
 
     if (sectionName === "deploy") {
         loadBuilds();
@@ -75,10 +193,10 @@ function loadStats() {
         })
         .then((data) => {
             validateStats(data);
-            document.getElementById("stat-agents").textContent = data.agents;
-            document.getElementById("stat-pending").textContent = data.pending;
-            document.getElementById("stat-completed").textContent = data.completed;
-            document.getElementById("stat-builds").textContent = data.builds;
+            updateStatValue("stat-agents", data.agents);
+            updateStatValue("stat-pending", data.pending);
+            updateStatValue("stat-completed", data.completed);
+            updateStatValue("stat-builds", data.builds);
             statsLoaded = true;
             status.textContent = "";
         })
@@ -243,6 +361,7 @@ function toggleTaskHistory() {
     taskHistoryOpen = !taskHistoryOpen;
     taskListEl.classList.toggle("collapsed", !taskHistoryOpen);
     document.getElementById("toggle-arrow").classList.toggle("open", taskHistoryOpen);
+    document.getElementById("task-toggle")?.setAttribute("aria-expanded", taskHistoryOpen ? "true" : "false");
 }
 
 function loadTasks(agentId) {
@@ -331,9 +450,8 @@ function refreshAgents() {
             if (data.agents.length === 0) {
                 agentListEl.innerHTML = `
                     <div class="empty-state" id="empty-agents">
-                        <span class="empty-icon">📡</span>
-                        <p>No agents connected</p>
-                        <p class="empty-sub">Waiting for check-ins…</p>
+                        <p>No agents registered</p>
+                        <p class="empty-sub">Build and run an agent to begin.</p>
                     </div>
                 `;
                 agentsLoaded = true;
@@ -350,20 +468,23 @@ function refreshAgents() {
                     const now = new Date();
                     const diffSec = (now - lastSeen) / 1000;
                     const isAlive = diffSec < 30;
+                    const previousState = agentOnlineStates.get(a.id);
+                    const stateChanged = previousState !== undefined && previousState !== isAlive;
+                    const isNewAgent = !seenAgentIds.has(a.id);
                     const statusClass = isAlive ? "active" : "";
 
                     return `
-                    <div class="agent-card ${isSelected}" data-agent-id="${escapeHtml(a.id)}" onclick="selectAgent(${htmlStringArgument(a.id)})">
+                    <div class="agent-card ${isSelected} ${isNewAgent ? "agent-enter" : ""}" data-agent-id="${escapeHtml(a.id)}" onclick="selectAgent(${htmlStringArgument(a.id)})">
                         <div class="agent-card-top">
-                            <span class="agent-status-dot ${statusClass}"></span>
+                            <span class="agent-status-dot ${statusClass} ${stateChanged ? "state-changed" : ""}"></span>
                             <span class="agent-hostname">${escapeHtml(a.hostname)}</span>
                             <span class="agent-os-badge">${escapeHtml(a.os)}</span>
                         </div>
                         <div class="agent-card-bottom">
                             ${a.transport_mode === 'reality'
-                                ? `<span class="agent-transport-badge reality" title="${escapeHtml(a.decoy_domain || 'unknown')}">🛡️ REALITY · ${escapeHtml(a.decoy_domain || 'unknown')}</span>`
+                                ? `<span class="agent-transport-badge reality" title="${escapeHtml(a.decoy_domain || 'unknown')}">REALITY · ${escapeHtml(a.decoy_domain || 'unknown')}</span>`
                                 : a.transport_mode === 'https_pinned'
-                                    ? `<span class="agent-transport-badge tls">🔒 TLS</span> <span class="agent-detail">${escapeHtml(a.ip || 'N/A')}</span>`
+                                    ? `<span class="agent-transport-badge tls">TLS</span> <span class="agent-detail">${escapeHtml(a.ip || 'N/A')}</span>`
                                     : a.transport_mode === 'http'
                                         ? `<span class="agent-detail">${escapeHtml(a.ip || 'N/A')}</span>`
                                         : `<span class="agent-detail" title="No unique build association">Transport unknown · ${escapeHtml(a.ip || 'N/A')}</span>`
@@ -381,6 +502,11 @@ function refreshAgents() {
                 `;
                 })
                 .join("");
+            data.agents.forEach((a) => {
+                const lastSeen = new Date(a.last_seen);
+                agentOnlineStates.set(a.id, (new Date() - lastSeen) / 1000 < 30);
+                seenAgentIds.add(a.id);
+            });
             agentsLoaded = true;
             status.textContent = "";
         })
@@ -473,7 +599,7 @@ function buildAgent(event) {
 
     clearTimeout(buildNoticeTimer);
     buildNoticeTimer = null;
-    buildBtn.disabled = true;
+    setActionButtonState(buildBtn, "loading", "Building");
     progressEl.classList.remove("hidden");
     progressText.style.color = "";
     const modeLabel = isReality ? "REALITY" : transportMode === "https_pinned" ? "HTTPS+Pin" : "HTTP";
@@ -487,9 +613,10 @@ function buildAgent(event) {
         .then((res) => res.json())
         .then((data) => {
             if (data.error) {
-                progressText.textContent = `❌ Error: ${data.error}`;
-                progressText.style.color = "#ff5252";
-                buildBtn.disabled = false;
+                progressText.textContent = `Error: ${data.error}`;
+                progressText.style.color = "#e36d6d";
+                settleActionButton(buildBtn, "error", "Build failed", 1300);
+                showToast(`Build failed: ${data.error}`, "error", 4200);
                 buildNoticeTimer = setTimeout(() => {
                     progressEl.classList.add("hidden");
                     progressText.style.color = "";
@@ -499,30 +626,32 @@ function buildAgent(event) {
 
             let transportTag = "";
             if (data.transport_mode === "reality") {
-                transportTag = " | 🛡️ REALITY";
+                transportTag = " | REALITY";
                 if (data.decoy_domain) transportTag += ` · ${data.decoy_domain}`;
             } else if (data.tls_pinned) {
-                transportTag = " | 🔒 TLS pinned";
+                transportTag = " | TLS pinned";
             }
 
-            progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)}${transportTag})`;
-            progressText.style.color = "#00e676";
+            progressText.textContent = `Built successfully (${formatFileSize(data.file_size)}${transportTag})`;
+            progressText.style.color = "#55c58a";
+            settleActionButton(buildBtn, "success", "Build complete", 1000);
+            showToast("Build completed and download started.", "success");
 
             triggerDownload(data.build_id, data.filename || `agent_${config.target_os}_${config.arch}`);
 
             loadBuilds();
             loadStats();
 
-            buildBtn.disabled = false;
             buildNoticeTimer = setTimeout(() => {
                 progressEl.classList.add("hidden");
                 progressText.style.color = "";
             }, 4000);
         })
         .catch((err) => {
-            progressText.textContent = `❌ Network error: ${err.message}`;
-            progressText.style.color = "#ff5252";
-            buildBtn.disabled = false;
+            progressText.textContent = `Network error: ${err.message}`;
+            progressText.style.color = "#e36d6d";
+            settleActionButton(buildBtn, "error", "Build failed", 1300);
+            showToast(`Build failed: ${err.message}`, "error", 4200);
             buildNoticeTimer = setTimeout(() => {
                 progressEl.classList.add("hidden");
                 progressText.style.color = "";
@@ -543,9 +672,8 @@ function loadBuilds() {
             if (data.builds.length === 0) {
                 payloadList.innerHTML = `
                     <div class="empty-state">
-                        <span class="empty-icon">📦</span>
-                        <p>No payloads generated yet</p>
-                        <p class="empty-sub">Build your first agent above</p>
+                        <p>No builds yet</p>
+                        <p class="empty-sub">Generated artifacts will appear here.</p>
                     </div>
                 `;
                 return;
@@ -557,11 +685,11 @@ function loadBuilds() {
                         let transportBadge = '';
                         if (b.transport_mode === 'reality') {
                             const domain = b.decoy_domain ? ` · ${escapeHtml(b.decoy_domain)}` : '';
-                            transportBadge = `<span class="payload-reality-badge" title="${escapeHtml(b.decoy_domain || '')}">🛡️ REALITY${domain}</span>`;
+                            transportBadge = `<span class="payload-reality-badge" title="${escapeHtml(b.decoy_domain || '')}">REALITY${domain}</span>`;
                         } else if (b.transport_mode === 'https_pinned') {
-                            transportBadge = '<span class="payload-tls-badge">🔒 TLS</span>';
+                            transportBadge = '<span class="payload-tls-badge">TLS</span>';
                         } else {
-                            transportBadge = '<span class="payload-http-badge">🌐 HTTP</span>';
+                            transportBadge = '<span class="payload-http-badge">HTTP</span>';
                         }
                         return `
                 <div class="payload-item">
@@ -571,7 +699,7 @@ function loadBuilds() {
                     <span class="payload-size">${formatFileSize(b.file_size)}</span>
                     <span class="payload-date">${formatTimestamp(b.created_at)}</span>
                     <div class="payload-actions">
-                        <button class="btn-download" onclick="downloadBuild(${b.id}, ${htmlStringArgument(b.filename)})">⬇ Download</button>
+                        <button class="btn-download" onclick="downloadBuild(${b.id}, ${htmlStringArgument(b.filename)})">Download</button>
                         <button class="btn-delete" onclick="deleteBuild(${b.id})">✕</button>
                     </div>
                 </div>
@@ -708,10 +836,24 @@ function forceDeleteAgent(agentId) {
 // Rendering helpers.
 
 function appendToTerminal(html) {
-    const welcome = terminalOutput.querySelector(".terminal-welcome");
-    if (welcome) welcome.remove();
+    const welcome = terminalOutput.querySelector?.(".terminal-welcome");
+    if (welcome) welcome.remove?.();
 
+    const hasChildren = terminalOutput.children && typeof terminalOutput.children.length === "number";
+    const start = hasChildren ? terminalOutput.children.length : 0;
     terminalOutput.insertAdjacentHTML("beforeend", html);
+
+    if (hasChildren) {
+        Array.from(terminalOutput.children).slice(start).forEach((node, index) => {
+            if (!node.classList || !node.style) return;
+            node.classList.add("terminal-entry");
+            node.style.animationDelay = `${Math.min(index * 28, 84)}ms`;
+            setTimeout(() => {
+                node.classList.remove("terminal-entry");
+                node.style.animationDelay = "";
+            }, 360);
+        });
+    }
     terminalOutput.scrollTop = terminalOutput.scrollHeight;
 }
 
@@ -770,6 +912,7 @@ function toggleLoot() {
     const arrow = document.getElementById("loot-toggle-arrow");
     list.classList.toggle("collapsed", !lootOpen);
     arrow.classList.toggle("open", lootOpen);
+    document.getElementById("loot-toggle")?.setAttribute("aria-expanded", lootOpen ? "true" : "false");
     if (lootOpen) loadLoot();
 }
 
@@ -866,8 +1009,7 @@ function stageFile() {
     const formData = new FormData();
     formData.append("file", input.files[0]);
 
-    btn.disabled = true;
-    btn.textContent = "Uploading…";
+    setActionButtonState(btn, "loading", "Uploading");
 
     apiFetch("/api/files/stage", {
         method: "POST",
@@ -882,13 +1024,13 @@ function stageFile() {
             input.value = "";
             status.textContent = `Staged ${data.filename || "file"}.`;
             loadStagedFiles();
-            btn.disabled = false;
-            btn.textContent = "📤 Upload & Stage";
+            settleActionButton(btn, "success", "Staged", 900);
+            showToast(`Staged ${data.filename || "file"}.`, "success");
         })
         .catch((err) => {
             status.textContent = "Upload failed: " + err.message;
-            btn.disabled = false;
-            btn.textContent = "📤 Upload & Stage";
+            settleActionButton(btn, "error", "Upload failed", 1200);
+            showToast(`Upload failed: ${err.message}`, "error", 4200);
         });
 }
 
@@ -906,9 +1048,7 @@ function sendFileToAgent(input) {
     formData.append("file", file);
 
     const btn = document.getElementById("send-file-btn");
-    const originalText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = "⏳ Uploading...";
+    setActionButtonState(btn, "loading", "Uploading");
 
     appendToTerminal(`
         <div class="cmd-line">
@@ -947,8 +1087,8 @@ function sendFileToAgent(input) {
         .finally(() => {
             input.value = ""; // Reset file input
             fileUploadInProgress = false;
+            setActionButtonState(btn, "idle", "");
             btn.disabled = !selectedAgentId;
-            btn.innerHTML = originalText;
         });
 }
 
@@ -1000,6 +1140,181 @@ function deleteStagedFile(fileId) {
         .catch((err) => { status.textContent = `Staged file deletion failed: ${err.message}`; });
 }
 
+// Custom select controls.
+function closeCustomSelect(shell, returnFocus = false) {
+    if (!shell) return;
+    shell.classList.remove("open");
+    const trigger = shell.querySelector(".custom-select-trigger");
+    if (trigger) {
+        trigger.setAttribute("aria-expanded", "false");
+        if (returnFocus) trigger.focus();
+    }
+}
+
+function closeAllCustomSelects(except = null) {
+    document.querySelectorAll(".custom-select-shell.open").forEach((shell) => {
+        if (shell !== except) closeCustomSelect(shell);
+    });
+}
+
+function customSelectOptionButtons(shell) {
+    return Array.from(shell.querySelectorAll(".custom-select-option:not(:disabled)"));
+}
+
+function focusCustomSelectOption(shell, direction = 1) {
+    const options = customSelectOptionButtons(shell);
+    if (!options.length) return;
+    const selected = shell.querySelector(".custom-select-option.is-selected:not(:disabled)");
+    const startIndex = selected ? options.indexOf(selected) : -1;
+    const nextIndex = startIndex >= 0
+        ? (startIndex + direction + options.length) % options.length
+        : (direction > 0 ? 0 : options.length - 1);
+    options[nextIndex].focus();
+}
+
+function syncCustomSelect(select) {
+    if (!select || typeof select.closest !== "function") return;
+    const shell = select.closest(".custom-select-shell");
+    if (!shell) return;
+
+    const trigger = shell.querySelector(".custom-select-trigger");
+    const valueEl = shell.querySelector(".custom-select-value");
+    const menu = shell.querySelector(".custom-select-menu");
+    const selectedOption = select.options[select.selectedIndex];
+
+    if (valueEl) valueEl.textContent = selectedOption ? selectedOption.textContent.trim() : "Select";
+    if (trigger) trigger.disabled = !!select.disabled;
+    if (!menu) return;
+
+    menu.innerHTML = "";
+    Array.from(select.options).forEach((option, index) => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "custom-select-option";
+        item.textContent = option.textContent.trim();
+        item.dataset.index = String(index);
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", option.selected ? "true" : "false");
+        item.disabled = option.disabled;
+        if (option.selected) item.classList.add("is-selected");
+
+        item.addEventListener("click", () => {
+            if (option.disabled) return;
+            select.selectedIndex = index;
+            syncCustomSelect(select);
+            select.dispatchEvent(new Event("input", { bubbles: true }));
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+            closeCustomSelect(shell, true);
+        });
+
+        item.addEventListener("keydown", (event) => {
+            const options = customSelectOptionButtons(shell);
+            const currentIndex = options.indexOf(item);
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                const delta = event.key === "ArrowDown" ? 1 : -1;
+                const next = options[(currentIndex + delta + options.length) % options.length];
+                if (next) next.focus();
+            } else if (event.key === "Home") {
+                event.preventDefault();
+                options[0]?.focus();
+            } else if (event.key === "End") {
+                event.preventDefault();
+                options[options.length - 1]?.focus();
+            } else if (event.key === "Escape") {
+                event.preventDefault();
+                closeCustomSelect(shell, true);
+            }
+        });
+
+        menu.appendChild(item);
+    });
+}
+
+function enhanceCustomSelect(select) {
+    if (!select || select.dataset.customSelect === "true") return;
+    select.dataset.customSelect = "true";
+
+    const shell = document.createElement("div");
+    shell.className = "custom-select-shell";
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "custom-select-trigger";
+    trigger.setAttribute("role", "combobox");
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+
+    const menuId = `${select.id || "select"}-custom-listbox`;
+    trigger.setAttribute("aria-controls", menuId);
+    const label = select.closest(".form-group")?.querySelector("label")?.textContent?.trim();
+    if (label) trigger.setAttribute("aria-label", label);
+
+    const value = document.createElement("span");
+    value.className = "custom-select-value";
+    const chevron = document.createElement("span");
+    chevron.className = "custom-select-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    trigger.append(value, chevron);
+
+    const menu = document.createElement("div");
+    menu.className = "custom-select-menu";
+    menu.id = menuId;
+    menu.setAttribute("role", "listbox");
+
+    select.parentNode.insertBefore(shell, select);
+    shell.append(select, trigger, menu);
+    select.classList.add("custom-select-native");
+    select.tabIndex = -1;
+
+    trigger.addEventListener("click", () => {
+        if (trigger.disabled) return;
+        const shouldOpen = !shell.classList.contains("open");
+        closeAllCustomSelects(shell);
+        shell.classList.toggle("open", shouldOpen);
+        trigger.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+        if (shouldOpen) {
+            syncCustomSelect(select);
+            scheduleFrame(() => focusCustomSelectOption(shell, 1));
+        }
+    });
+
+    trigger.addEventListener("keydown", (event) => {
+        if (trigger.disabled) return;
+        if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+            event.preventDefault();
+            if (!shell.classList.contains("open")) {
+                closeAllCustomSelects(shell);
+                shell.classList.add("open");
+                trigger.setAttribute("aria-expanded", "true");
+                syncCustomSelect(select);
+            }
+            scheduleFrame(() => focusCustomSelectOption(shell, event.key === "ArrowUp" ? -1 : 1));
+        } else if (event.key === "Escape") {
+            closeCustomSelect(shell);
+        }
+    });
+
+    select.addEventListener("change", () => syncCustomSelect(select));
+    select.addEventListener("input", () => syncCustomSelect(select));
+    syncCustomSelect(select);
+}
+
+function enhanceCustomSelects() {
+    document.querySelectorAll("select.form-select").forEach(enhanceCustomSelect);
+}
+
+function syncAllCustomSelects() {
+    document.querySelectorAll("select.form-select").forEach(syncCustomSelect);
+}
+
+document.addEventListener("pointerdown", (event) => {
+    const shell = event.target.closest?.(".custom-select-shell");
+    closeAllCustomSelects(shell || null);
+});
+
+enhanceCustomSelects();
+
 // Keep the default profile consistent with the selected OS.
 const buildOsSelect = document.getElementById("build-os");
 const buildProfileSelect = document.getElementById("build-profile");
@@ -1014,6 +1329,8 @@ function syncBuildTargetFields() {
     if (buildArch386Option.disabled && buildArchSelect.value === "386") {
         buildArchSelect.value = "amd64";
     }
+    syncCustomSelect(buildProfileSelect);
+    syncCustomSelect(buildArchSelect);
 }
 
 if (buildOsSelect && buildProfileSelect && buildArchSelect && buildArch386Option) {
@@ -1030,8 +1347,10 @@ commandInput.addEventListener("keydown", (e) => {
 });
 
 refreshBtn.addEventListener("click", () => {
-    refreshBtn.style.transform = "rotate(360deg)";
-    setTimeout(() => (refreshBtn.style.transform = ""), 400);
+    refreshBtn.classList.remove("refresh-spin");
+    void refreshBtn.offsetWidth;
+    refreshBtn.classList.add("refresh-spin");
+    setTimeout(() => refreshBtn.classList.remove("refresh-spin"), 420);
     refreshAgents();
 });
 
@@ -1045,6 +1364,7 @@ setInterval(() => {
 // Initial load
 refreshAgents();
 loadStats();
+scheduleFrame(() => positionNavIndicator());
 
 // Sync transport-field visibility with the selector's current value.
 // Browsers may restore a previously selected option (e.g. REALITY) after
@@ -1057,17 +1377,32 @@ toggleTransportFields();
 if (typeof window !== "undefined" && window.addEventListener) {
     window.addEventListener("pageshow", () => {
         toggleTransportFields();
-        setTimeout(toggleTransportFields, 0);
+        syncAllCustomSelects();
+        positionNavIndicator();
+        setTimeout(() => {
+            toggleTransportFields();
+            syncAllCustomSelects();
+        }, 0);
     });
     window.addEventListener("load", () => {
         toggleTransportFields();
-        setTimeout(toggleTransportFields, 0);
+        syncAllCustomSelects();
+        positionNavIndicator();
+        setTimeout(() => {
+            toggleTransportFields();
+            syncAllCustomSelects();
+        }, 0);
     });
 }
 if (typeof document !== "undefined" && document.addEventListener) {
     document.addEventListener("DOMContentLoaded", () => {
         toggleTransportFields();
-        setTimeout(toggleTransportFields, 0);
+        syncAllCustomSelects();
+        positionNavIndicator();
+        setTimeout(() => {
+            toggleTransportFields();
+            syncAllCustomSelects();
+        }, 0);
     });
 }
 const transportSelector = document.getElementById("build-transport");
@@ -1159,8 +1494,7 @@ function generateCert(event) {
     const btn    = document.getElementById("tls-gen-btn");
     const result = document.getElementById("tls-gen-result");
 
-    btn.disabled = true;
-    btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATING…</span>';
+    setActionButtonState(btn, "loading", "Generating");
     result.classList.add("hidden");
     result.textContent = "";
 
@@ -1171,13 +1505,12 @@ function generateCert(event) {
     })
         .then((r) => r.json())
         .then((data) => {
-            btn.disabled = false;
-            btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATE CERTIFICATE</span>';
-
             if (data.error) {
                 result.className = "tls-gen-result error";
                 result.textContent = "Error: " + data.error;
                 result.classList.remove("hidden");
+                settleActionButton(btn, "error", "Generation failed", 1300);
+                showToast(`Certificate generation failed: ${data.error}`, "error", 4200);
                 return;
             }
 
@@ -1187,26 +1520,27 @@ function generateCert(event) {
                 <strong>Expires:</strong> ${new Date(data.not_valid_after).toLocaleDateString()}<br>
                 <span class="tls-restart-note">Restart the server to apply. Rebuild all agents with the new pin.</span>`;
             result.classList.remove("hidden");
+            settleActionButton(btn, "success", "Certificate generated", 1000);
+            showToast("Certificate generated. Restart the server to apply it.", "success");
 
             loadTlsStatus();
         })
         .catch((err) => {
-            btn.disabled = false;
-            btn.innerHTML = '<span class="btn-build-icon">⚡</span><span class="btn-build-text">GENERATE CERTIFICATE</span>';
             result.className = "tls-gen-result error";
             result.textContent = "Network error: " + err.message;
             result.classList.remove("hidden");
+            settleActionButton(btn, "error", "Generation failed", 1300);
+            showToast(`Certificate generation failed: ${err.message}`, "error", 4200);
         });
 }
 
 function deleteCert() {
-    if (!confirm("Delete the certificate and key? The server will fall back to HTTP on next restart. All pinned agents will stop connecting.")) return;
+    if (!confirm("Delete the certificate and key? The server will switch to HTTP after restart. Existing certificate-pinned agents will no longer connect.")) return;
 
     const btn = document.getElementById("tls-delete-btn");
     const status = document.getElementById("tls-action-status");
     status.textContent = "";
-    btn.disabled = true;
-    btn.textContent = "DELETING…";
+    setActionButtonState(btn, "loading", "Deleting");
 
     apiFetch("/api/tls/delete", { method: "DELETE" })
         .then(async (res) => {
@@ -1215,16 +1549,15 @@ function deleteCert() {
             return data;
         })
         .then((data) => {
-            btn.disabled = false;
-            btn.textContent = "DELETE CERTIFICATE";
-
+            settleActionButton(btn, "success", "Deleted", 900);
             status.textContent = "Certificate deleted. Restart the server to apply the change.";
+            showToast("Certificate deleted. Restart the server to return to HTTP.", "success");
             loadTlsStatus();
         })
         .catch((err) => {
-            btn.disabled = false;
-            btn.textContent = "DELETE CERTIFICATE";
+            settleActionButton(btn, "error", "Delete failed", 1200);
             status.textContent = "Certificate deletion failed: " + err.message;
+            showToast(`Certificate deletion failed: ${err.message}`, "error", 4200);
         });
 }
 

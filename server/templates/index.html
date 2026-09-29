@@ -14,12 +14,12 @@
         rel="stylesheet">
 </head>
 
-<body>
+<body class="control-mode">
 
     <!-- Sidebar navigation -->
     <nav class="sidebar" id="sidebar">
         <div class="sidebar-brand">
-            <span class="brand-icon">⬡</span>
+            <span class="brand-icon">C2</span>
             <div class="brand-text">
                 <span class="brand-name">C2</span>
                 <span class="brand-sub">Project</span>
@@ -27,16 +27,35 @@
         </div>
 
         <div class="sidebar-nav">
-            <button class="nav-item active" data-section="control" id="nav-control" onclick="switchSection('control')">
-                <span class="nav-icon">⌘</span>
+            <span class="nav-selection-indicator" id="nav-selection-indicator" aria-hidden="true"></span>
+            <button class="nav-item active" data-section="control" data-tooltip="Control" id="nav-control" onclick="switchSection('control')" aria-label="Control">
+                <span class="nav-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                        <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+                        <path d="M7 9l3 3-3 3"></path>
+                        <path d="M13 15h4"></path>
+                    </svg>
+                </span>
                 <span class="nav-label">Control</span>
             </button>
-            <button class="nav-item" data-section="deploy" id="nav-deploy" onclick="switchSection('deploy')">
-                <span class="nav-icon">⚙</span>
+            <button class="nav-item" data-section="deploy" data-tooltip="Deploy" id="nav-deploy" onclick="switchSection('deploy')" aria-label="Deploy">
+                <span class="nav-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                        <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"></path>
+                        <path d="M4.5 7.8L12 12l7.5-4.2"></path>
+                        <path d="M12 12v9"></path>
+                    </svg>
+                </span>
                 <span class="nav-label">Deploy</span>
             </button>
-            <button class="nav-item" data-section="tls" id="nav-tls" onclick="switchSection('tls')">
-                <span class="nav-icon">🔒</span>
+            <button class="nav-item" data-section="tls" data-tooltip="TLS" id="nav-tls" onclick="switchSection('tls')" aria-label="TLS">
+                <span class="nav-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                        <path d="M12 3l7 3v5c0 4.8-2.7 8.2-7 10-4.3-1.8-7-5.2-7-10V6l7-3z"></path>
+                        <rect x="9" y="10" width="6" height="5" rx="1"></rect>
+                        <path d="M10.5 10V8.8a1.5 1.5 0 013 0V10"></path>
+                    </svg>
+                </span>
                 <span class="nav-label">TLS</span>
             </button>
         </div>
@@ -44,7 +63,7 @@
         <div class="sidebar-footer">
             <div class="server-status" id="server-status">
                 <span class="status-dot online"></span>
-                <span class="status-text">ONLINE</span>
+                <span class="status-text">Server Online</span>
             </div>
         </div>
     </nav>
@@ -54,6 +73,13 @@
 
         <!-- Control -->
         <section class="section active" id="section-control">
+            <header class="page-header">
+                <div>
+                    <p class="page-kicker">Operations</p>
+                    <h1>Control</h1>
+                    <p class="page-description">Monitor agents, issue tasks, and review results.</p>
+                </div>
+            </header>
 
             <!-- Stat Cards -->
             <div class="stat-bar">
@@ -96,7 +122,7 @@
                 <aside class="panel agent-panel">
                     <div class="panel-header">
                         <h2 class="panel-title">
-                            <span class="panel-icon">◉</span> Agents
+                            Agents
                         </h2>
                         <button class="btn-icon" id="refresh-agents" title="Refresh">⟳</button>
                     </div>
@@ -104,9 +130,8 @@
                     <p class="download-status" id="agents-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     <div class="agent-list" id="agent-list">
                         <div class="empty-state" id="empty-agents">
-                            <span class="empty-icon">📡</span>
-                            <p>Agent list unavailable</p>
-                            <p class="empty-sub">Waiting for a successful refresh…</p>
+                            <p>No agents registered</p>
+                            <p class="empty-sub">Build and run an agent to begin.</p>
                         </div>
                     </div>
                 </aside>
@@ -115,7 +140,6 @@
                 <section class="panel terminal-panel">
                     <div class="panel-header">
                         <h2 class="panel-title">
-                            <span class="panel-icon">⌘</span>
                             <span id="interaction-title">Select an Agent</span>
                         </h2>
                         <span class="selected-agent-id" id="selected-agent-badge"></span>
@@ -125,12 +149,9 @@
                     <div class="terminal" id="terminal">
                         <div class="terminal-output" id="terminal-output">
                             <div class="terminal-welcome">
-                                <pre class="ascii-art">
- ╔═══════════════════════════════════════╗
- ║     C 2   P R O J E C T               ║
- ║     Command & Control Framework       ║
- ╚═══════════════════════════════════════╝</pre>
-                                <p class="welcome-text">Select an agent to begin issuing commands.</p>
+                                <div class="terminal-welcome-mark">C2</div>
+                                <p class="terminal-welcome-title">No agent selected</p>
+                                <p class="welcome-text">Choose an agent from the list to view history and issue tasks.</p>
                             </div>
                         </div>
                     </div>
@@ -138,15 +159,15 @@
                     <!-- Command Input -->
                     <div class="command-bar" id="command-bar">
                         <span class="prompt-symbol">❯</span>
-                        <input type="text" id="command-input" class="command-input" placeholder="Enter command… (prefix with &quot;shell&quot; for shell execution)"
+                        <input type="text" id="command-input" class="command-input" placeholder="Enter command…"
                             autocomplete="off" disabled>
                         <button class="btn-send" id="send-btn" disabled onclick="sendCommand()">
-                            EXEC ⏎
+                            Run
                         </button>
                         <button class="btn-send-file" id="send-file-btn" disabled
                             onclick="document.getElementById('send-file-input').click()"
                             title="Send a file to the agent">
-                            📁 Send File
+                            Send File
                         </button>
                         <input type="file" id="send-file-input" style="display:none" onchange="sendFileToAgent(this)">
                     </div>
@@ -161,8 +182,8 @@
 
                     <!-- Task History (Collapsible) -->
                     <div class="task-history-section">
-                        <button class="task-history-toggle" id="task-toggle" onclick="toggleTaskHistory()">
-                            <span class="panel-icon">☰</span> Task History
+                        <button class="task-history-toggle" id="task-toggle" onclick="toggleTaskHistory()" aria-expanded="false">
+                            Task History
                             <span class="toggle-arrow" id="toggle-arrow">▾</span>
                         </button>
                         <div class="task-list collapsed" id="task-list">
@@ -175,8 +196,8 @@
 
                     <!-- Loot (Exfiltrated Files) -->
                     <div class="task-history-section">
-                        <button class="task-history-toggle" onclick="toggleLoot()">
-                            <span class="panel-icon">🗃</span> Exfiltrated Files (Loot)
+                        <button class="task-history-toggle" id="loot-toggle" onclick="toggleLoot()" aria-expanded="false">
+                            Collected Files
                             <span class="toggle-arrow" id="loot-toggle-arrow">▾</span>
                         </button>
                         <div class="loot-list collapsed" id="loot-list">
@@ -193,6 +214,13 @@
 
         <!-- Deploy -->
         <section class="section" id="section-deploy">
+            <header class="page-header">
+                <div>
+                    <p class="page-kicker">Builds</p>
+                    <h1>Deploy</h1>
+                    <p class="page-description">Build target-specific agents and manage staged files.</p>
+                </div>
+            </header>
 
             <div class="deploy-layout">
 
@@ -200,18 +228,19 @@
                 <div class="panel deploy-form-panel">
                     <div class="panel-header">
                         <h2 class="panel-title">
-                            <span class="panel-icon">⚙</span> Build Agent Payload
+                            Build Agent
                         </h2>
                     </div>
 
                     <form class="build-form" id="build-form" onsubmit="buildAgent(event)">
+                        <div class="form-section-label">Target</div>
                         <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label" for="build-os">Target OS</label>
                                 <select class="form-select" id="build-os">
-                                    <option value="windows">🪟 Windows</option>
-                                    <option value="linux">🐧 Linux</option>
-                                    <option value="mac">🍎 macOS</option>
+                                    <option value="windows">Windows</option>
+                                    <option value="linux">Linux</option>
+                                    <option value="mac">macOS</option>
                                 </select>
                             </div>
                             <div class="form-group">
@@ -224,21 +253,22 @@
                             </div>
                         </div>
 
+                        <div class="form-section-label">Transport</div>
                         <div class="form-group">
                             <label class="form-label" for="build-transport">Transport Mode</label>
                             <select class="form-select" id="build-transport" onchange="toggleTransportFields()">
-                                <option value="http">🌐 HTTP (direct)</option>
-                                <option value="https_pinned">🔒 HTTPS + Certificate Pin</option>
-                                <option value="reality">🛡️ REALITY (uTLS + VLESS)</option>
+                                <option value="http">HTTP (direct)</option>
+                                <option value="https_pinned">HTTPS + Certificate Pin</option>
+                                <option value="reality">REALITY (uTLS + VLESS)</option>
                             </select>
-                            <span class="form-hint">How the agent reaches the C2 server. REALITY uses a uTLS fingerprint preset and VLESS tunnel; browser equivalence has not been measured.</span>
+                            <span class="form-hint">Select the transport used by the agent. REALITY uses a uTLS preset and VLESS tunnel; browser equivalence has not been measured.</span>
                         </div>
 
                         <div class="form-group" id="server-url-group">
                             <label class="form-label" for="build-url">Server Callback URL</label>
                             <input type="text" class="form-input" id="build-url" placeholder="http://192.168.1.100:5000"
                                 value="http://localhost:5000">
-                            <span class="form-hint">The address the agent will phone home to</span>
+                            <span class="form-hint">Server endpoint used for agent check-ins.</span>
                         </div>
 
                         <!-- REALITY-specific fields (hidden by default) -->
@@ -278,18 +308,19 @@
                             </div>
                         </div>
 
+                        <div class="form-section-label">Runtime profile</div>
                         <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label" for="build-jitter-min">Jitter Min (seconds)</label>
                                 <input type="number" class="form-input" id="build-jitter-min" value="8" min="1"
                                     max="3599">
-                                <span class="form-hint">Shortest possible beacon interval</span>
+                                <span class="form-hint">Minimum polling interval.</span>
                             </div>
                             <div class="form-group">
                                 <label class="form-label" for="build-jitter-max">Jitter Max (seconds)</label>
                                 <input type="number" class="form-input" id="build-jitter-max" value="15" min="2"
                                     max="3600">
-                                <span class="form-hint">Longest possible beacon interval</span>
+                                <span class="form-hint">Maximum polling interval.</span>
                             </div>
                         </div>
 
@@ -297,13 +328,13 @@
                             <div class="form-group">
                                 <label class="form-label" for="build-profile">Browser Profile</label>
                                 <select class="form-select" id="build-profile">
-                                    <option value="1">🌐 Chrome / Windows</option>
-                                    <option value="2">🌐 Chrome / Linux</option>
-                                    <option value="3">🦊 Firefox / Windows</option>
-                                    <option value="4">🦊 Firefox / Linux</option>
-                                    <option value="5">🍎 Safari / macOS</option>
+                                    <option value="1">Chrome / Windows</option>
+                                    <option value="2">Chrome / Linux</option>
+                                    <option value="3">Firefox / Windows</option>
+                                    <option value="4">Firefox / Linux</option>
+                                    <option value="5">Safari / macOS</option>
                                 </select>
-                                <span class="form-hint">HTTP header profile and, for REALITY, the corresponding uTLS fingerprint family</span>
+                                <span class="form-hint">HTTP header profile. REALITY also maps this selection to the corresponding uTLS preset.</span>
                             </div>
                             <div class="form-group">
                                 <label class="form-label" for="build-locale">Locale (Accept-Language)</label>
@@ -321,13 +352,12 @@
                                     <option value="registry">Registry Run Key / Cron (Legacy)</option>
                                     <option value="scheduled_task">Scheduled Task / Systemd (Recommended)</option>
                                 </select>
-                                <span class="form-hint">How the agent survives reboot. "Scheduled Task / Systemd" uses the Task Scheduler COM API (Windows) or a systemd user service (Linux) with no child process spawned.</span>
+                                <span class="form-hint">Persistence mechanism configured for the generated agent. Available options depend on the target OS.</span>
                             </div>
                         </div>
 
                         <button type="submit" class="btn-build" id="build-btn">
-                            <span class="btn-build-icon">⚡</span>
-                            <span class="btn-build-text">BUILD & DOWNLOAD</span>
+                            <span class="btn-build-text">Build &amp; Download</span>
                         </button>
                         <p class="inline-action-error" id="build-validation-status" role="alert"></p>
                     </form>
@@ -345,15 +375,14 @@
                 <div class="panel payloads-panel">
                     <div class="panel-header">
                         <h2 class="panel-title">
-                            <span class="panel-icon">📦</span> Generated Payloads
+                            Generated Builds
                         </h2>
                         <button class="btn-icon" id="refresh-builds" onclick="loadBuilds()" title="Refresh">⟳</button>
                     </div>
                     <div class="payload-list" id="payload-list">
                         <div class="empty-state">
-                            <span class="empty-icon">📦</span>
-                            <p>No payloads generated yet</p>
-                            <p class="empty-sub">Build your first agent above</p>
+                            <p>No builds yet</p>
+                            <p class="empty-sub">Generated artifacts will appear here.</p>
                         </div>
                     </div>
                     <p class="download-status" id="download-status" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -364,16 +393,16 @@
                 <div class="panel stage-panel">
                     <div class="panel-header">
                         <h2 class="panel-title">
-                            <span class="panel-icon">📤</span> Stage Files
+                            Stage Files
                         </h2>
                         <button class="btn-icon" onclick="loadStagedFiles()" title="Refresh">⟳</button>
                     </div>
-                    <p class="panel-sub">Upload files here, then push them to an agent with:
+                    <p class="panel-sub">Upload a file, then queue it for an agent with:
                         <code>download &lt;ID&gt; &lt;save_path&gt;</code>
                     </p>
                     <div class="stage-upload-row">
                         <input type="file" id="stage-file-input" class="stage-file-input">
-                        <button class="btn-stage" id="stage-btn" onclick="stageFile()">📤 Upload &amp; Stage</button>
+                        <button class="btn-stage" id="stage-btn" onclick="stageFile()">Upload &amp; Stage</button>
                     </div>
                     <p class="download-status" id="stage-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     <p class="download-status" id="staged-delete-status" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -388,6 +417,13 @@
 
         <!-- TLS -->
         <section class="section" id="section-tls">
+            <header class="page-header">
+                <div>
+                    <p class="page-kicker">Transport security</p>
+                    <h1>TLS</h1>
+                    <p class="page-description">Inspect, rotate, or remove the server certificate.</p>
+                </div>
+            </header>
             <div class="tls-layout">
 
                 <!-- Left column: Status + Danger -->
@@ -396,7 +432,7 @@
                     <!-- Certificate Status -->
                     <div class="panel">
                         <div class="panel-header">
-                            <h2 class="panel-title"><span class="panel-icon">🔒</span> Certificate Status</h2>
+                            <h2 class="panel-title">Certificate Status</h2>
                             <button class="btn-icon" onclick="loadTlsStatus()" title="Refresh">⟳</button>
                         </div>
                         <div id="tls-status-body" class="tls-status-body">
@@ -407,11 +443,11 @@
                     <!-- Danger Zone -->
                     <div class="panel">
                         <div class="panel-header">
-                            <h2 class="panel-title"><span class="panel-icon">⚠</span> Danger Zone</h2>
+                            <h2 class="panel-title">Danger Zone</h2>
                         </div>
                         <div class="tls-danger-body">
-                            <p class="form-hint">Delete the current certificate and key. The server will fall back to HTTP on next restart. All pinned agents will stop connecting.</p>
-                            <button class="btn-delete-cert" id="tls-delete-btn" onclick="deleteCert()">DELETE CERTIFICATE</button>
+                            <p class="form-hint">Deleting the certificate switches the server to HTTP after restart. Existing agents using certificate-pinned HTTPS will no longer connect.</p>
+                            <button class="btn-delete-cert" id="tls-delete-btn" onclick="deleteCert()">Delete Certificate</button>
                             <p class="download-status" id="tls-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                         </div>
                     </div>
@@ -421,9 +457,10 @@
                 <!-- Right column: Generate form -->
                 <div class="panel tls-gen-panel">
                     <div class="panel-header">
-                        <h2 class="panel-title"><span class="panel-icon">⚡</span> Generate Certificate</h2>
+                        <h2 class="panel-title">Generate Certificate</h2>
                     </div>
                     <form id="tls-gen-form" class="build-form" onsubmit="generateCert(event)">
+                        <div class="form-section-label">Certificate details</div>
                         <div class="form-group">
                             <label class="form-label" for="tls-cn">Common Name (CN)</label>
                             <input class="form-input" type="text" id="tls-cn" placeholder="e.g. 203.0.113.10 or c2.example.com" required>
@@ -447,11 +484,10 @@
                             <span class="form-hint">How long the certificate is valid</span>
                         </div>
                         <div id="tls-gen-warning" class="tls-overwrite-warning hidden">
-                            <span class="tls-warn-icon">⚠</span> Generating a new certificate will invalidate all agents built with the current pin. They will need to be rebuilt.
+                            <span class="tls-warn-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3 22 20H2L12 3Z"></path><path d="M12 9v5"></path><path d="M12 17.5h.01"></path></svg></span> Generating a new certificate will invalidate all agents built with the current pin. They will need to be rebuilt.
                         </div>
                         <button type="submit" class="btn-build" id="tls-gen-btn">
-                            <span class="btn-build-icon">⚡</span>
-                            <span class="btn-build-text">GENERATE CERTIFICATE</span>
+                            <span class="btn-build-text">Generate Certificate</span>
                         </button>
                     </form>
                     <div id="tls-gen-result" class="tls-gen-result hidden"></div>
@@ -461,6 +497,8 @@
         </section>
 
     </main>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
     <script src="/static/dashboard.js"></script>
 </body>

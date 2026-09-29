@@ -5,20 +5,50 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>C2 Operator Login</title>
     <meta name="description" content="C2 operator authentication">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="login-page">
-    <main class="auth-box login-box">
-        <span class="auth-icon">⬡</span>
-        <h1 class="auth-title">C2 Project</h1>
-        <p class="auth-sub">Enter the operator API key to open the dashboard</p>
-        <form method="post" action="/login">
-            <label class="sr-only" for="operator-api-key">Operator API key</label>
-            <input type="password" class="auth-input" id="operator-api-key" name="api_key"
-                placeholder="API key" autocomplete="current-password" required autofocus>
-            <button class="auth-btn" type="submit">AUTHENTICATE</button>
-        </form>
-        {% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
+    <main class="login-shell">
+        <section class="auth-box login-box" aria-labelledby="login-title">
+            <div class="login-brand">
+                <span class="login-brand-mark" aria-hidden="true">C2</span>
+                <div class="login-brand-copy">
+                    <span class="login-brand-name">C2 Project</span>
+                    <span class="login-brand-sub">Operator Console</span>
+                </div>
+            </div>
+
+            <div class="login-heading">
+                <p class="page-kicker">Operator access</p>
+                <h1 class="auth-title" id="login-title">Sign in</h1>
+                <p class="auth-sub">Authenticate with the operator API key to open the dashboard.</p>
+            </div>
+
+            <form method="post" action="/login">
+                <div class="auth-field">
+                    <label class="auth-label" for="operator-api-key">Operator API key</label>
+                    <input type="password" class="auth-input" id="operator-api-key" name="api_key"
+                        placeholder="Enter API key" autocomplete="current-password" required autofocus>
+                </div>
+                <button class="auth-btn" type="submit">
+                    <span>Continue</span>
+                    <svg class="auth-btn-arrow" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M5 12h14"></path>
+                        <path d="m14 7 5 5-5 5"></path>
+                    </svg>
+                </button>
+            </form>
+
+            {% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
+
+            <div class="login-footnote">
+                <span class="login-status-dot" aria-hidden="true"></span>
+                Authorized operator access only
+            </div>
+        </section>
     </main>
 </body>
 </html>
