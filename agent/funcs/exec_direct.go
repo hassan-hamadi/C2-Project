@@ -75,7 +75,10 @@ func splitDiagnosticArgs(command string) (string, []string) {
 	}
 
 	binary := tokens[0]
-	args := tokens[1:]
+	var args []string
+	if len(tokens) > 1 {
+		args = tokens[1:]
+	}
 	return binary, args
 }
 

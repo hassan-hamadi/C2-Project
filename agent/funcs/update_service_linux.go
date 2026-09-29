@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // registerUpdateDaemon creates a systemd user service that starts the
@@ -55,7 +56,6 @@ WantedBy=default.target
 		return fmt.Errorf("enable failed: %s - %w", string(out), err)
 	}
 
-	fmt.Printf("[+] Update daemon registered (systemd user service): %s\n", unitName)
 	return nil
 }
 
@@ -69,11 +69,22 @@ func removeUpdateDaemon() error {
 	unitName := ServiceLabel + ".service"
 	unitPath := filepath.Join(home, ".config", "systemd", "user", unitName)
 
-	// Disable the service (ignore errors — may not be enabled).
-	exec.Command("systemctl", "--user", "disable", unitName).CombinedOutput()
+	// If the unit file is already gone, cleanup is idempotently complete.
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to inspect unit file: %w", err)
+	}
 
-	// Stop the service (ignore errors — may not be running).
-	exec.Command("systemctl", "--user", "stop", unitName).CombinedOutput()
+	statusOutput, statusErr := exec.Command("systemctl", "--user", "is-enabled", unitName).CombinedOutput()
+	status := strings.TrimSpace(string(statusOutput))
+	if statusErr == nil {
+		if out, err := exec.Command("systemctl", "--user", "disable", unitName).CombinedOutput(); err != nil {
+			return fmt.Errorf("disable failed: %s - %w", string(out), err)
+		}
+	} else if status != "disabled" && status != "static" && status != "masked" && status != "not-found" {
+		return fmt.Errorf("inspect enablement failed: %s - %w", string(statusOutput), statusErr)
+	}
 
 	// Remove the unit file.
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
@@ -81,8 +92,9 @@ func removeUpdateDaemon() error {
 	}
 
 	// Reload so systemd forgets about the unit.
-	exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput()
+	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("daemon-reload failed: %s - %w", string(out), err)
+	}
 
-	fmt.Printf("[-] Update daemon removed (systemd user service): %s\n", unitName)
 	return nil
 }

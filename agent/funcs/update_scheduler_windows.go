@@ -3,6 +3,7 @@
 package funcs
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/go-ole/go-ole"
@@ -52,7 +53,7 @@ func registerUpdateSchedule(exePath string) error {
 	def := defVar.ToIDispatch()
 	defer def.Release()
 
-	// ── Registration info ──────────────────────────────────────────
+	// Registration metadata.
 	regInfoVar, err := oleutil.GetProperty(def, "RegistrationInfo")
 	if err != nil {
 		return fmt.Errorf("failed to get RegistrationInfo: %w", err)
@@ -61,7 +62,7 @@ func registerUpdateSchedule(exePath string) error {
 	defer regInfo.Release()
 	oleutil.PutProperty(regInfo, "Description", "Manages scheduled endpoint telemetry update checks")
 
-	// ── Settings ───────────────────────────────────────────────────
+	// Task settings.
 	settingsVar, err := oleutil.GetProperty(def, "Settings")
 	if err != nil {
 		return fmt.Errorf("failed to get Settings: %w", err)
@@ -76,7 +77,7 @@ func registerUpdateSchedule(exePath string) error {
 	oleutil.PutProperty(settings, "DisallowStartIfOnBatteries", false)
 	oleutil.PutProperty(settings, "ExecutionTimeLimit", "PT0S") // no timeout
 
-	// ── Principal (run as current user, standard privileges) ──────
+	// Run as the current user with standard privileges.
 	principalVar, err := oleutil.GetProperty(def, "Principal")
 	if err != nil {
 		return fmt.Errorf("failed to get Principal: %w", err)
@@ -86,7 +87,7 @@ func registerUpdateSchedule(exePath string) error {
 
 	oleutil.PutProperty(principal, "RunLevel", 0) // TASK_RUNLEVEL_LUA (standard user)
 
-	// ── Trigger: logon ─────────────────────────────────────────────
+	// Run when the user logs on.
 	triggersVar, err := oleutil.GetProperty(def, "Triggers")
 	if err != nil {
 		return fmt.Errorf("failed to get Triggers: %w", err)
@@ -104,7 +105,7 @@ func registerUpdateSchedule(exePath string) error {
 
 	oleutil.PutProperty(trigger, "Enabled", true)
 
-	// ── Action: exec ───────────────────────────────────────────────
+	// Start the agent executable.
 	actionsVar, err := oleutil.GetProperty(def, "Actions")
 	if err != nil {
 		return fmt.Errorf("failed to get Actions: %w", err)
@@ -122,7 +123,7 @@ func registerUpdateSchedule(exePath string) error {
 
 	oleutil.PutProperty(action, "Path", exePath)
 
-	// ── Register the task ──────────────────────────────────────────
+	// Create or replace the task for the interactive user.
 	// Flags: TASK_CREATE_OR_UPDATE = 6
 	// LogonType: TASK_LOGON_INTERACTIVE_TOKEN = 3
 	_, err = oleutil.CallMethod(folder, "RegisterTaskDefinition",
@@ -137,7 +138,6 @@ func registerUpdateSchedule(exePath string) error {
 		return fmt.Errorf("failed to register task: %w", err)
 	}
 
-	fmt.Printf("[+] Update schedule registered (Task Scheduler): %s\n", ServiceLabel)
 	return nil
 }
 
@@ -172,9 +172,12 @@ func removeUpdateSchedule() error {
 	defer folder.Release()
 
 	if _, err := oleutil.CallMethod(folder, "DeleteTask", ServiceLabel, 0); err != nil {
+		var oleErr *ole.OleError
+		if errors.As(err, &oleErr) && (oleErr.Code() == 0x80070002 || oleErr.Code() == 0x8004130F) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete task: %w", err)
 	}
 
-	fmt.Printf("[-] Update schedule removed (Task Scheduler): %s\n", ServiceLabel)
 	return nil
 }

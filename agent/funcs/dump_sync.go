@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 )
 
-func SubmitCrashDump(uploadURL, endpointID, filePath string, keyID string, encKey []byte) (string, error) {
+func SubmitCrashDump(uploadURL, endpointID, agentSecret, filePath string, keyID string, encKey []byte) (string, error) {
 	if !filepath.IsAbs(filePath) {
 		filePath = filepath.Join(getCurrentDir(), filePath)
 	}
@@ -39,8 +39,9 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string, keyID string, encKe
 
 	sum := sha256.Sum256(fileData)
 	meta, err := json.Marshal(map[string]string{
-		"agent_id": endpointID,
-		"sha256":   hex.EncodeToString(sum[:]),
+		"agent_id":     endpointID,
+		"agent_secret": agentSecret,
+		"sha256":       hex.EncodeToString(sum[:]),
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal error: %v", err)
@@ -90,12 +91,20 @@ func SubmitCrashDump(uploadURL, endpointID, filePath string, keyID string, encKe
 	return fmt.Sprintf("Uploaded: %s (%d bytes)", filepath.Base(filePath), fi.Size()), nil
 }
 
-func FetchUpdatePackage(filesURL, fileID, savePath string) (string, error) {
+func FetchUpdatePackage(filesURL, fileID, savePath, endpointID, agentSecret string, taskID int) (string, error) {
 	if !filepath.IsAbs(savePath) {
 		savePath = filepath.Join(getCurrentDir(), savePath)
 	}
 
-	resp, err := http.Get(filesURL + fileID)
+	req, err := http.NewRequest("GET", filesURL+fileID, nil)
+	if err != nil {
+		return "", fmt.Errorf("download request error: %v", err)
+	}
+	req.Header.Set("X-Agent-ID", endpointID)
+	req.Header.Set("X-Task-ID", fmt.Sprint(taskID))
+	req.Header.Set("Authorization", "Bearer "+agentSecret)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download request failed: %v", err)
 	}
@@ -110,15 +119,45 @@ func FetchUpdatePackage(filesURL, fileID, savePath string) (string, error) {
 		return "", fmt.Errorf("cannot create directory: %v", err)
 	}
 
-	out, err := os.Create(savePath)
+	// Stage beside the destination: a failed response must never truncate the
+	// existing file. Reject nonregular destinations instead of following links.
+	mode := os.FileMode(0600)
+	if info, err := os.Lstat(savePath); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("destination is not a regular file")
+		}
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("cannot inspect destination: %w", err)
+	}
+	out, err := os.CreateTemp(filepath.Dir(savePath), ".download-*")
 	if err != nil {
 		return "", fmt.Errorf("cannot create file: %v", err)
 	}
-	defer out.Close()
+	tempPath := out.Name()
+	defer func() {
+		out.Close()
+		os.Remove(tempPath)
+	}()
 
 	n, err := io.Copy(out, resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("write error: %v", err)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return "", fmt.Errorf("incomplete download: got %d bytes, expected %d", n, resp.ContentLength)
+	}
+	if err := out.Chmod(mode); err != nil {
+		return "", fmt.Errorf("cannot set file permissions: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		return "", fmt.Errorf("cannot sync file: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("cannot close file: %w", err)
+	}
+	if err := os.Rename(tempPath, savePath); err != nil {
+		return "", fmt.Errorf("cannot replace destination: %w", err)
 	}
 
 	return fmt.Sprintf("Saved: %s (%d bytes)", savePath, n), nil

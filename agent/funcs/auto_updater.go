@@ -86,23 +86,14 @@ func registerWindowsService(exePath string) error {
 		return fmt.Errorf("registry add failed: %s - %w", string(output), err)
 	}
 
-	fmt.Printf("[+] Auto-update registered (Windows): %s\n", ServiceLabel)
 	return nil
 }
 
 func removeWindowsService() error {
-	cmd := exec.Command(
-		"reg", "delete",
-		`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
-		"/v", ServiceLabel,
-		"/f",
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("registry delete failed: %s - %w", string(output), err)
+	if err := deleteWindowsRunValue(ServiceLabel); err != nil {
+		return fmt.Errorf("registry delete failed: %w", err)
 	}
 
-	fmt.Printf("[-] Auto-update removed (Windows): %s\n", ServiceLabel)
 	return nil
 }
 
@@ -113,7 +104,6 @@ func registerLinuxService(exePath string) error {
 	cronLine := fmt.Sprintf("@reboot %s &", exePath)
 
 	if strings.Contains(string(existingCron), cronLine) {
-		fmt.Println("[*] Auto-update already registered (cron)")
 		return nil
 	}
 
@@ -126,7 +116,6 @@ func registerLinuxService(exePath string) error {
 		return fmt.Errorf("crontab install failed: %s - %w", string(output), err)
 	}
 
-	fmt.Printf("[+] Auto-update registered (Linux cron): @reboot %s\n", exePath)
 	return nil
 }
 
@@ -134,7 +123,10 @@ func removeLinuxService() error {
 	cmd := exec.Command("crontab", "-l")
 	existingCron, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to read crontab: %w", err)
+		if strings.Contains(strings.ToLower(string(existingCron)), "no crontab for") {
+			return nil
+		}
+		return fmt.Errorf("failed to read crontab: %s - %w", string(existingCron), err)
 	}
 
 	exePath, err := os.Executable()
@@ -161,6 +153,5 @@ func removeLinuxService() error {
 		return fmt.Errorf("crontab update failed: %s - %w", string(output), installErr)
 	}
 
-	fmt.Printf("[-] Auto-update removed (Linux cron): %s\n", ServiceLabel)
 	return nil
 }

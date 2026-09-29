@@ -5,9 +5,8 @@ import (
 	"time"
 )
 
-// CalculateBackoff picks a random duration somewhere between min and max.
-// If you pass a bad range (min >= max), it just returns min and moves on.
-// Kept separate from the sleep call so it can be tested without actually waiting.
+// CalculateBackoff returns a random duration in [min, max), or min for an
+// invalid range.
 func CalculateBackoff(min, max time.Duration) time.Duration {
 	if min >= max {
 		return min
@@ -16,8 +15,7 @@ func CalculateBackoff(min, max time.Duration) time.Duration {
 	return min + time.Duration(rand.Int63n(int64(delta)))
 }
 
-// DelayNextSync blocks for a random amount of time between min and max.
-// It calls CalculateBackoff to pick the value, then hands it off to time.Sleep.
+// DelayNextSync waits for a randomized interval.
 func DelayNextSync(min, max time.Duration) {
 	time.Sleep(CalculateBackoff(min, max))
 }

