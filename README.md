@@ -98,9 +98,11 @@ Persistence and self-removal run at user scope. The self-destruct path removes p
 
 ## Task and result behavior
 
-Tasks default to direct execution, which resolves a program and passes arguments without shell expansion. Prefix a dashboard command with `shell` when pipes, redirection, chaining, or other shell behavior is required. The `cd`, `get`, and `download` commands have agent-side handling:
+The dashboard defaults to direct execution, which resolves a program and passes arguments without shell expansion. Prefix a dashboard command with `shell` when pipes, redirection, chaining, or other shell behavior is required. API clients submitting `POST /api/task` must explicitly set `type` to `exec` or `shell`. The API returns HTTP 400 for a missing or invalid `type`.
 
-- `cd <directory>` changes the process working directory for later tasks.
+The `cd`, `get`, and `download` commands have agent-side handling:
+
+- `cd <directory>` changes the working directory for later tasks. A directory change fails while an earlier task is active. After a failed change, the agent reports an error for new tasks that use the working directory until a `cd <directory>` succeeds.
 - `get <path>` uploads a regular file to the server.
 - `download <file_id> <path>` retrieves a staged file assigned to that task and writes it without following a destination symlink.
 
@@ -130,7 +132,7 @@ The repository includes:
 - a Chromium UI check when a local Chromium-compatible binary is available
 - local generated-agent transport tests for direct HTTP and pinned HTTPS
 
-The final local audit runs `python -m unittest discover`, `go test`, `go test -race`, `go vet`, the Node dashboard suite, JavaScript syntax checks, and the local transport suite. A live agent-to-Xray-to-Flask REALITY session has not been recorded, so live compatibility remains unverified. Windows code is cross-compiled and unit-tested from the development host; a live Windows run is still required for platform-specific operational assurance.
+The final local audit runs `python -m unittest discover`, `go test`, `go test -race`, `go vet`, the Node dashboard suite, JavaScript syntax checks, and the local transport suite. One live agent-to-Xray-to-Flask REALITY session has been completed against Xray-core 26.10.29 using a Linux agent; a live Windows REALITY session has not yet been recorded. The session required an explicit freedom-outbound allow rule for the `127.0.0.1:5000` destination, documented in [`REALITY.md`](REALITY.md) along with a complete example Xray configuration. Broader live-behavior verification, including packet-level similarity, remains future work. Windows code is cross-compiled and unit-tested from the development host; a live Windows run is still required for platform-specific operational assurance.
 
 > **About the test suite:** The Python regression and integration tests in this repository were created with AI assistance during development and code review. They are primarily designed as targeted verification harnesses for specific behaviors and regressions, making them especially useful when using AI-assisted development tools to modify or audit the project. They are ordinary Python tests, however, and can also be run and inspected manually like the rest of the test suite.
 
@@ -163,7 +165,7 @@ The framework deliberately keeps track of behaviors that may still distinguish i
 | macOS persistence | **Not implemented** | macOS agents can be built without persistence, but the build server rejects persistent macOS configurations. | Add persistence only after it can be implemented and tested on an actual macOS environment. |
 | Interactive sessions | **Not implemented** | The task model is asynchronous request-response. Programs requiring persistent interactive input or a TTY are outside the current architecture. | Treat interactive execution as a separate architectural feature rather than extending the existing task queue implicitly. |
 | Agent relay or chaining | **Not implemented** | Agents connect to their configured HTTP(S) server or REALITY/Xray edge directly. The framework has no peer relay for systems that cannot reach that endpoint. | Evaluate relay architecture separately if segmented-network testing becomes a project goal. |
-| Live REALITY behavior | **Implementation present, integration evidence pending** | The REALITY client, VLESS framing, build pipeline, and local tests are present, but a complete live agent-to-Xray-to-Flask session has not yet been recorded. Decoy behavior and packet-level similarity therefore remain unproven. | Run a controlled authorized deployment, preserve packet captures and version information, and document observed behavior separately from implementation assumptions. |
+| Live REALITY behavior | **Partially verified** | The REALITY client, VLESS framing, build pipeline, and local tests are present, and one complete live agent-to-Xray-to-Flask session has been completed against Xray-core 26.10.29 using a Linux agent, after adding the freedom-outbound loopback allow rule documented in [`REALITY.md`](REALITY.md). Windows REALITY builds, decoy behavior, and packet-level similarity remain unmeasured in live sessions. | Preserve packet captures and version information from further controlled deployments, and document observed behavior separately from implementation assumptions. |
 | Windows platform behavior | **Partially verified** | Windows-specific code is unit-tested where possible and cross-compiles successfully, but cleanup, locking, persistence, and file replacement have not all been exercised on a live Windows host. | Run the existing regression scenarios on a dedicated Windows test machine and record platform-specific results. |
 
 Resolved issues such as encrypted application payloads, nonce replay handling, pinned-HTTPS validation, agent authentication, durable result acknowledgement, and server-side operator authentication are documented elsewhere in this README and are not repeated here.
@@ -179,6 +181,7 @@ server/static/             Dashboard JavaScript and CSS
 server/templates/          Login and dashboard templates
 server/tests/              Dashboard test harness and UI tests
 requirements.txt           Python dependencies
+CHANGES.md                 Dated changelog of resolved issues and lessons learned
 REALITY.md                 REALITY transport guide
 THIRD_PARTY_NOTICES.md     Adapted-source attribution
 ```

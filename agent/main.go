@@ -81,13 +81,19 @@ func main() {
 				continue
 			}
 
-			// cd runs synchronously so the updated working directory is visible to the next job
+			// A directory change is rejected while earlier tasks still depend on it.
 			if funcs.IsPathUpdate(job.Command) {
 				output, cdErr := funcs.ExecuteDiagnosticTask(job.Command)
 				if cdErr != nil {
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}
 				submitResultWithRetry(job.ID, output, false)
+				continue
+			}
+
+			releaseDirectory, err := funcs.HoldWorkingDirectory()
+			if err != nil {
+				submitResultWithRetry(job.ID, fmt.Sprintf("Task not started: %v", err), false)
 				continue
 			}
 
@@ -98,6 +104,7 @@ func main() {
 					if err != nil {
 						output = fmt.Sprintf("Upload error: %v", err)
 					}
+					releaseDirectory()
 					submitResultWithRetry(t.ID, output, false)
 				}(job)
 				continue
@@ -108,6 +115,7 @@ func main() {
 					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
 					parts := strings.SplitN(args, " ", 2)
 					if len(parts) != 2 {
+						releaseDirectory()
 						submitResultWithRetry(t.ID, "Usage: download <file_id> <save_path>", false)
 						return
 					}
@@ -115,6 +123,7 @@ func main() {
 					if err != nil {
 						output = fmt.Sprintf("Download error: %v", err)
 					}
+					releaseDirectory()
 					submitResultWithRetry(t.ID, output, false)
 				}(job)
 				continue
@@ -135,6 +144,7 @@ func main() {
 				if execErr != nil && output == "" {
 					output = fmt.Sprintf("Error: %v", execErr)
 				}
+				releaseDirectory()
 				submitResultWithRetry(t.ID, output, false)
 			}(job)
 		}

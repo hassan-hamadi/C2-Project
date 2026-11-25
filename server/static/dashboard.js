@@ -1,5 +1,6 @@
 // Dashboard state and API operations.
 let selectedAgentId = null;
+const commandDrafts = new Map();
 let taskHistoryOpen = false;
 const REFRESH_INTERVAL = 5000;
 let buildNoticeTimer = null;
@@ -211,6 +212,13 @@ function loadStats() {
 // Agent selection.
 
 function selectAgent(agentId) {
+    if (selectedAgentId !== agentId) {
+        if (selectedAgentId !== null) {
+            if (commandInput.value) commandDrafts.set(selectedAgentId, commandInput.value);
+            else commandDrafts.delete(selectedAgentId);
+        }
+        commandInput.value = commandDrafts.get(agentId) ?? "";
+    }
     selectedAgentId = agentId;
     terminalViewVersion++;
     taskHistoryVersion++;
@@ -273,7 +281,10 @@ function sendCommand(submission = null) {
         <div class="cmd-status pending" data-submission-id="${submissionId}">⏳ Submitting task…</div>
     `);
 
-    if (!submission) commandInput.value = "";
+    if (!submission) {
+        commandInput.value = "";
+        commandDrafts.delete(agentId);
+    }
 
     return apiFetch("/api/task", {
         method: "POST",
@@ -812,10 +823,12 @@ function forceDeleteAgent(agentId) {
             if (!res.ok || data.status !== "ok") {
                 throw new Error(data.error || `Server returned ${res.status}`);
             }
+            commandDrafts.delete(agentId);
             if (selectedAgentId === agentId) {
                 selectedAgentId = null;
                 taskHistoryVersion++;
                 taskCommands.clear();
+                commandInput.value = "";
                 commandInput.disabled = true;
                 sendBtn.disabled = true;
                 document.getElementById("send-file-btn").disabled = true;

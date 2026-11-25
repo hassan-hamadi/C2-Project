@@ -1044,7 +1044,9 @@ class ReviewFixesTests(unittest.TestCase):
             {**valid, field: value}
             for field in ("agent_id", "command")
             for value in (None, [], {}, 1, True, "", "  ", "bad\x00value")
-        ], {**valid, "type": []}]
+        ], {"agent_id": self.agent_id, "command": "fixture"}, *[
+            {**valid, "type": value} for value in (None, [], True, "", "invalid")
+        ]]
         with patch.object(self.server, "get_db_connection", side_effect=AssertionError("Opened DB")):
             for data in cases:
                 with self.subTest(data=data):
@@ -1057,18 +1059,25 @@ class ReviewFixesTests(unittest.TestCase):
         headers = {"X-API-Key": self.server.API_KEY}
         command = "echo  spaced fixture  "
         response = self.client.post("/api/task", json={
-            "agent_id": self.agent_id, "command": command,
+            "agent_id": self.agent_id, "command": command, "type": "exec",
         }, headers=headers)
         self.assertEqual(response.status_code, 200)
         task_id = response.json["task_id"]
+        shell = self.client.post("/api/task", json={
+            "agent_id": self.agent_id, "command": command, "type": "shell",
+        }, headers=headers)
+        self.assertEqual(shell.status_code, 200)
         unknown = self.client.post("/api/task", json={
-            "agent_id": "absent-agent", "command": "fixture",
+            "agent_id": "absent-agent", "command": "fixture", "type": "exec",
         }, headers=headers)
         self.assertEqual(unknown.status_code, 404)
         conn = self.database.get_db_connection()
         try:
-            rows = conn.execute("SELECT id, command, type FROM tasks").fetchall()
-            self.assertEqual([tuple(row) for row in rows], [(task_id, command, "shell")])
+            rows = conn.execute("SELECT id, command, type FROM tasks ORDER BY id").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [
+                (task_id, command, "exec"),
+                (shell.json["task_id"], command, "shell"),
+            ])
         finally:
             conn.close()
 
@@ -1092,7 +1101,7 @@ class ReviewFixesTests(unittest.TestCase):
                 try:
                     with patch.object(self.server, "get_db_connection", return_value=FailingConnection()):
                         response = self.client.post("/api/task", json={
-                            "agent_id": self.agent_id, "command": "echo fixture",
+                            "agent_id": self.agent_id, "command": "echo fixture", "type": "exec",
                         }, headers=headers)
                     self.assertEqual(response.status_code, 500)
                     self.assertIsInstance(response.json["error"], str)

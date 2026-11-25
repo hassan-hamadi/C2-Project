@@ -105,7 +105,7 @@ class AgentAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.checkin("agent-b", self.secret_b).status_code, 200)
         queued = self.client.post(
             "/api/task",
-            json={"agent_id": "agent-a", "command": f"download {self.file_id} target.bin"},
+            json={"agent_id": "agent-a", "command": f"download {self.file_id} target.bin", "type": "exec"},
             headers={"X-API-Key": self.server.API_KEY},
         )
         self.assertEqual(queued.status_code, 200)
@@ -150,7 +150,7 @@ class AgentAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.checkin("agent-b", self.secret_b).status_code, 200)
         queued = self.client.post(
             "/api/task",
-            json={"agent_id": "agent-a", "command": "whoami"},
+            json={"agent_id": "agent-a", "command": "whoami", "type": "exec"},
             headers={"X-API-Key": self.server.API_KEY},
         )
         task_id = queued.json["task_id"]

@@ -394,9 +394,9 @@ def submit_task():
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
             return jsonify({"error": f"{field} must be a nonempty string without NUL characters"}), 400
 
-    task_type = data.get("type", "shell")
+    task_type = data.get("type")
     if task_type not in ("exec", "shell"):
-        return jsonify({"error": "Invalid task type. Must be 'exec' or 'shell'"}), 400
+        return jsonify({"error": "type is required and must be 'exec' or 'shell'"}), 400
 
     conn = get_db_connection()
     try:
@@ -1113,13 +1113,19 @@ func main() {{
 				continue
 			}}
 
-			// cd is handled synchronously, it mutates CurrentDir which subsequent commands depend on
+			// A directory change is rejected while earlier tasks still depend on it.
 			if funcs.IsPathUpdate(job.Command) {{
 				output, cdErr := funcs.ExecuteDiagnosticTask(job.Command)
 				if cdErr != nil {{
 					output = fmt.Sprintf("Error: %v", cdErr)
 				}}
 				submitResultWithRetry(job.ID, output, false)
+				continue
+			}}
+
+			releaseDirectory, err := funcs.HoldWorkingDirectory()
+			if err != nil {{
+				submitResultWithRetry(job.ID, fmt.Sprintf("Task not started: %v", err), false)
 				continue
 			}}
 
@@ -1130,6 +1136,7 @@ func main() {{
 					if err != nil {{
 						output = fmt.Sprintf("Upload error: %v", err)
 					}}
+					releaseDirectory()
 					submitResultWithRetry(t.ID, output, false)
 				}}(job)
 				continue
@@ -1140,6 +1147,7 @@ func main() {{
 					args := strings.TrimSpace(strings.TrimPrefix(t.Command, "download "))
 					parts := strings.SplitN(args, " ", 2)
 					if len(parts) != 2 {{
+						releaseDirectory()
 						submitResultWithRetry(t.ID, "Usage: download <file_id> <save_path>", false)
 						return
 					}}
@@ -1147,6 +1155,7 @@ func main() {{
 					if err != nil {{
 						output = fmt.Sprintf("Download error: %v", err)
 					}}
+					releaseDirectory()
 					submitResultWithRetry(t.ID, output, false)
 				}}(job)
 				continue
@@ -1166,6 +1175,7 @@ func main() {{
 				if execErr != nil && output == "" {{
 					output = fmt.Sprintf("Error: %v", execErr)
 				}}
+				releaseDirectory()
 				submitResultWithRetry(t.ID, output, false)
 			}}(job)
 		}}

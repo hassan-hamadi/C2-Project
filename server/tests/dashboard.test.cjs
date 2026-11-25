@@ -117,12 +117,12 @@ test('failed or malformed list responses produce an error, not an empty state', 
         context.loadBuilds();
         await flush();
         assert.match(get('payload-list').innerHTML, /Unable to load builds/);
-        assert.doesNotMatch(get('payload-list').innerHTML, /No payloads generated/);
+        assert.doesNotMatch(get('payload-list').innerHTML, /No builds yet/);
     }
     context.apiFetch = async () => ({ok: true, json: async () => ({builds: []})});
     context.loadBuilds();
     await flush();
-    assert.match(get('payload-list').innerHTML, /No payloads generated/);
+    assert.match(get('payload-list').innerHTML, /No builds yet/);
 });
 
 test('an HTTP download failure never saves the error response', async () => {
@@ -477,7 +477,7 @@ test('agent refresh failures preserve the last list, show a warning, and recover
     context.apiFetch = async () => ({ok: true, json: async () => ({agents: []})});
     context.refreshAgents();
     await flush();
-    assert.match(get('agent-list').innerHTML, /No agents connected/);
+    assert.match(get('agent-list').innerHTML, /No agents registered/);
     assert.equal(get('agents-status').textContent, '');
 });
 
@@ -528,7 +528,7 @@ test('slow polling can still display a result while a newer request is pending',
     assert.match(get('agent-list').innerHTML, /saved-host/);
     pending[1]({ok: true, json: async () => ({agents: []})});
     await flush();
-    assert.match(get('agent-list').innerHTML, /No agents connected/);
+    assert.match(get('agent-list').innerHTML, /No agents registered/);
 });
 
 test('build validation and staged upload errors use visible status without blocking', async () => {
@@ -612,6 +612,36 @@ test('switching agents ignores a pending task submission response', async () => 
     assert.equal(get('terminal-output').innerHTML, otherTerminal);
     assert.deepEqual([...intervals.keys()], initialIntervals);
     assert.deepEqual([...timers.keys()], initialTimers);
+});
+
+test('unsent command drafts stay with their agent across selection changes', async () => {
+    const {context, get} = createDashboard();
+    context.loadTasks = () => {};
+    const requests = [];
+    context.apiFetch = async (url, options) => {
+        assert.equal(url, '/api/task');
+        requests.push(JSON.parse(options.body));
+        return {ok: true, json: async () => ({task_id: 1})};
+    };
+
+    const input = get('command-input');
+    context.selectAgent('agent-a');
+    input.value = 'draft for A';
+    context.selectAgent('agent-b');
+    assert.equal(input.value, '');
+    context.sendCommand();
+    assert.deepEqual(requests, []);
+
+    input.value = 'draft for B';
+    context.selectAgent('agent-a');
+    assert.equal(input.value, 'draft for A');
+    await context.sendCommand();
+    assert.deepEqual(requests, [{agent_id: 'agent-a', command: 'draft for A', type: 'exec'}]);
+
+    context.selectAgent('agent-b');
+    assert.equal(input.value, 'draft for B');
+    context.selectAgent('agent-a');
+    assert.equal(input.value, '');
 });
 
 test('a result already in flight cannot render after switching agents or returning to the old agent', async () => {

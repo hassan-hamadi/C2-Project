@@ -201,7 +201,7 @@ async function run() {
                         columns: getComputedStyle(row).gridTemplateColumns.split(' ').length,
                         rowOverflow: row.scrollWidth > row.clientWidth + 1,
                         buttonOverflow: button.scrollWidth > button.clientWidth + 1,
-                        gap: parseFloat(getComputedStyle(groups[1]).marginTop),
+                        gap: parseFloat(getComputedStyle(groups[0]).marginBottom),
                         label: !!document.querySelector('label[for="build-persist-method"]'),
                         selectStyled: persist.classList.contains('form-select'),
                         measurementLive: document.getElementById('decoy-domain-hint').getAttribute('aria-live'),
@@ -211,8 +211,8 @@ async function run() {
             });
             if (layout.result.exceptionDetails) throw new Error(JSON.stringify(layout.result.exceptionDetails));
             const measured = layout.result.result.value;
-            if (measured.children !== 6 || measured.columns !== (width === 1280 ? 6 : 2) ||
-                measured.rowOverflow || measured.buttonOverflow || measured.gap !== 20 ||
+            if (measured.children !== 6 || measured.columns !== 3 ||
+                measured.rowOverflow || measured.buttonOverflow || measured.gap !== 13 ||
                 !measured.label || !measured.selectStyled || measured.measurementLive !== 'polite' ||
                 measured.badgeTitle < 100) {
                 throw new Error('Layout regression at ' + width + ': ' + JSON.stringify(measured));

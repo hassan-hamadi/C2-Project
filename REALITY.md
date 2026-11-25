@@ -39,7 +39,7 @@ Choose **REALITY (uTLS + VLESS)** on the dashboard's Deploy page and provide eve
 
 | Dashboard field | Meaning | Validation in this project |
 | --- | --- | --- |
-| VPS Address | Xray listener address in `host:port` form. | Must be non-empty and contain a port separator. The agent passes it to the TCP dialer. |
+| VPS Address | Xray listener address in `host:port` form. | Must be non-empty and contain a port separator. The agent passes it to the TCP dialer. Use Xray's REALITY port (typically `:443`), never Flask's port (`:5000`). This field is where the agent performs the REALITY handshake itself; the inner Flask destination is configured separately by the build pipeline. |
 | Decoy Domain | REALITY `serverName` and TLS SNI. | Must be a hostname when measured. Build input rejects control characters and excessive length. |
 | X25519 Public Key | Public key corresponding to Xray's REALITY private key. | Base64 or base64url input must decode to 32 bytes. |
 | Short ID | One short ID accepted by the Xray inbound. | Non-empty hexadecimal input, at most 8 decoded bytes. |
@@ -71,8 +71,104 @@ Prepare an Xray REALITY/VLESS inbound whose values agree with the build:
 4. Allow the selected short ID.
 5. Configure a VLESS client with the selected UUID.
 6. Permit the VLESS request to connect to `127.0.0.1:5000` from Xray's network namespace.
+7. Explicitly allow that loopback destination on the outbound. Recent Xray-core releases (verified with 26.10.x) apply a default safety policy in the freedom outbound: traffic that arrives through a proxy inbound (VLESS, VMess, Trojan, Shadowsocks, Hysteria, or WireGuard) and targets a private or loopback address, including `127.0.0.1`, is silently blackholed instead of dialed. The policy stops an authenticated proxy client from reaching services on the Xray host itself. Because this framework's VLESS request is always `127.0.0.1:5000`, a default Xray deployment authenticates the agent, parses its VLESS request, and then drops the final hop unless an allow rule is present. Add a narrowly scoped `finalRules` entry to the freedom outbound:
+
+```json
+{
+  "protocol": "freedom",
+  "tag": "direct",
+  "settings": {
+    "finalRules": [
+      {
+        "action": "allow",
+        "network": "tcp",
+        "ip": ["127.0.0.1/32"],
+        "port": "5000"
+      }
+    ]
+  }
+}
+```
+
+The `network`, `ip`, and `port` fields keep the exemption limited to the Flask destination instead of opening the whole loopback or private range to proxy clients. See [XTLS/Xray-core discussion 7129](https://github.com/XTLS/Xray-core/discussions/7129) and [XTLS/Xray-core issue 7240](https://github.com/XTLS/Xray-core/issues/7240) for the upstream policy and the `finalRules` escape hatch.
 
 Xray configuration schemas can change between releases. Use the documentation for the Xray version you operate and keep its private key out of this repository. The dashboard needs only the public key; a REALITY private key is never required by this project.
+
+## Example Xray configuration
+
+The configuration below is a complete Xray config of the kind used for the verified live session, with credentials replaced by placeholders. It satisfies every requirement in the list above, including the loopback allow rule from step 7.
+
+```json
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "<vless-uuid>",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "gateway.icloud.com:443",
+          "xver": 0,
+          "serverNames": [
+            "gateway.icloud.com"
+          ],
+          "privateKey": "<x25519-private-key>",
+          "minClientVer": "",
+          "maxClientVer": "",
+          "maxTimeDiff": 0,
+          "shortIds": [
+            "<short-id>"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "finalRules": [
+          {
+            "action": "allow",
+            "network": "tcp",
+            "ip": ["127.0.0.1/32"],
+            "port": "5000"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Before using it, replace:
+
+- `<vless-uuid>` with the VLESS client UUID, the same value entered in the dashboard build form.
+- `<x25519-private-key>` with the REALITY private key. Generate a key pair with `xray x25519` and enter the printed public key in the dashboard, never the private key. The public half of an existing private key can be recovered with `xray x25519 -i <x25519-private-key>`.
+- `<short-id>` with a short ID the inbound accepts, the same value entered in the dashboard build form.
+
+Keep these points aligned with the agent build:
+
+- The inbound `port` must match the port in the dashboard's **VPS Address** field.
+- The decoy domain must appear in both `dest` and `serverNames`.
+- Do not remove the `finalRules` entry; without it Xray silently blackholes the agent's `127.0.0.1:5000` request.
+- `loglevel` is set to `warning` for normal operation. Raise it to `debug` only while troubleshooting, then restore it.
 
 ## Decoy-domain measurement
 
@@ -145,11 +241,17 @@ The agent does not print REALITY handshake material or connection diagnostics. A
 - Remember that failed agent check-ins are intentionally silent.
 - Preserve `server/c2.db`; it holds the build key and randomized agent route mapping needed to decrypt and route check-ins.
 
+**Xray logs `blocked target ... blackholing connection` and Flask stays silent**
+
+- Raise the Xray loglevel to `debug` and watch the journal live. The signature is `proxy/vless/inbound: received request for tcp:127.0.0.1:5000` followed by `proxy/freedom: blocked target: tcp:127.0.0.1:5000, blackholing connection for ...`.
+- The REALITY handshake and the VLESS request both succeeded; only the outbound hop to Flask was dropped. This is Xray's default loopback safety policy, not a REALITY or application failure. Apply the `finalRules` allow rule described under *Xray-side requirements* and restart Xray. A working hop logs `proxy/freedom: connection opened to tcp:127.0.0.1:5000`.
+- The block is invisible at the default `warning` loglevel, and Xray holds the blackholed connection open for a randomized period before closing it, so the agent sees only a stalled request and retries with no visible error anywhere. While debugging, use live log tails rather than comparing timestamps across services, and keep NTP enabled on every host so log timestamps remain comparable.
+
 ## Verification status and limitations
 
 Automated Go tests cover REALITY certificate-authentication paths, configuration lookup, VLESS request framing, response-header parsing, unsupported response versions, HTTP-over-stream behavior, and connection reuse. Python build tests compile generated REALITY agents and verify generated transport configuration. Local generated-agent integration tests cover direct HTTP and pinned HTTPS.
 
-A live end-to-end agent-to-Xray-to-Flask REALITY session has not been recorded in this repository. Live compatibility, behavior with a particular Xray release, decoy behavior, and packet-level similarity therefore remain unverified. Validate the complete path in an isolated authorized environment before relying on it.
+One live end-to-end agent-to-Xray-to-Flask REALITY session has been completed, against Xray-core 26.10.29 and using a Linux agent. Windows REALITY builds have not been exercised in a live session. Behavior with other Xray releases, decoy behavior, and packet-level similarity also remain unverified. Validate the complete path in an isolated authorized environment before relying on it.
 
 Current protocol limitations include:
 

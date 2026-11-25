@@ -15,8 +15,10 @@ import (
 const CommandTimeout = 120 * time.Second
 
 var (
-	currentDirMu sync.RWMutex
-	CurrentDir   string
+	currentDirMu               sync.RWMutex
+	CurrentDir                 string
+	activeDirectoryTasks       int
+	directoryNeedsConfirmation bool
 )
 
 func init() {
@@ -33,10 +35,20 @@ func getCurrentDir() string {
 	return CurrentDir
 }
 
-func setCurrentDir(dir string) {
+// HoldWorkingDirectory reserves the current directory before a task starts.
+// Its release function must be called once when the task has finished its work.
+func HoldWorkingDirectory() (func(), error) {
 	currentDirMu.Lock()
 	defer currentDirMu.Unlock()
-	CurrentDir = dir
+	if directoryNeedsConfirmation {
+		return nil, fmt.Errorf("working directory change failed; set the working directory with cd before starting another task")
+	}
+	activeDirectoryTasks++
+	return func() {
+		currentDirMu.Lock()
+		activeDirectoryTasks--
+		currentDirMu.Unlock()
+	}, nil
 }
 
 func IsPathUpdate(command string) bool {
@@ -63,6 +75,13 @@ func updateWorkingContext(command string) (string, error) {
 		return getCurrentDir(), nil
 	}
 
+	currentDirMu.Lock()
+	defer currentDirMu.Unlock()
+	directoryNeedsConfirmation = true
+	if activeDirectoryTasks > 0 {
+		return "", fmt.Errorf("cd: cannot change the working directory while another task is active")
+	}
+
 	if args == "~" || strings.HasPrefix(args, "~/") || strings.HasPrefix(args, "~\\") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -75,7 +94,7 @@ func updateWorkingContext(command string) (string, error) {
 	if filepath.IsAbs(args) {
 		newDir = args
 	} else {
-		newDir = filepath.Join(getCurrentDir(), args)
+		newDir = filepath.Join(CurrentDir, args)
 	}
 
 	newDir = filepath.Clean(newDir)
@@ -88,8 +107,9 @@ func updateWorkingContext(command string) (string, error) {
 		return "", fmt.Errorf("cd: %s: not a directory", args)
 	}
 
-	setCurrentDir(newDir)
-	return getCurrentDir(), nil
+	CurrentDir = newDir
+	directoryNeedsConfirmation = false
+	return newDir, nil
 }
 
 func ExecuteDiagnosticTask(command string) (string, error) {
