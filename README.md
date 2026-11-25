@@ -181,7 +181,7 @@ server/static/             Dashboard JavaScript and CSS
 server/templates/          Login and dashboard templates
 server/tests/              Dashboard test harness and UI tests
 requirements.txt           Python dependencies
-CHANGES.md                 Dated changelog of resolved issues and lessons learned
+TODO.md                    Detection-surface tracker for pending and completed work
 REALITY.md                 REALITY transport guide
 THIRD_PARTY_NOTICES.md     Adapted-source attribution
 ```
