@@ -127,7 +127,7 @@ The local SQLite database contains operator authentication material, build encry
 The repository includes:
 
 - Python regression and integration tests for server authentication, task lifecycle, build generation, storage permissions, file handling, TLS management, transport generation, replay handling, and cleanup paths
-- Go unit tests for encryption, direct execution parsing, retries and durable state, process locking, downloads, cleanup, pinning, header profiles, and REALITY/VLESS framing
+- Go unit tests for encryption, direct execution parsing, working-directory handling, retries and durable state, process locking, downloads, cleanup, pinning, header profiles, and REALITY/VLESS framing
 - Node tests for dashboard state, rendering, error handling, and request races
 - a Chromium UI check when a local Chromium-compatible binary is available
 - local generated-agent transport tests for direct HTTP and pinned HTTPS
@@ -181,6 +181,7 @@ server/static/             Dashboard JavaScript and CSS
 server/templates/          Login and dashboard templates
 server/tests/              Dashboard test harness and UI tests
 requirements.txt           Python dependencies
+ARCHITECTURE.md            System diagrams and component reference
 TODO.md                    Detection-surface tracker for pending and completed work
 REALITY.md                 REALITY transport guide
 THIRD_PARTY_NOTICES.md     Adapted-source attribution
